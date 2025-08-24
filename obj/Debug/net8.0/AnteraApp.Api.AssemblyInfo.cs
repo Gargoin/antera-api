@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AnteraApp.Api")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+9ce541b22718e7c3ba0f1834f50d6e535d48aded")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7325fe59290775dfede9967f2a568fae86731f77")]
 [assembly: System.Reflection.AssemblyProductAttribute("AnteraApp.Api")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AnteraApp.Api")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
