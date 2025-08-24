@@ -14,8 +14,21 @@ builder.Services.Configure<MongoDBSettings>(
 builder.Configuration.GetSection("MongoDB"));
 
 builder.Services.AddSingleton<AnteraService>();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend",
+        policy => policy
+            .WithOrigins("http://localhost:5173")
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+    );
+});
+
 
 var app = builder.Build();
+
+app.UseCors("AllowFrontend");
+
 
 // Configure the HTTP request pipeline.
 app.UseSwagger();
