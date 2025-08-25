@@ -38,3 +38,11 @@ C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\refint\AnteraApp.
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.pdb
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.genruntimeconfig.cache
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\ref\AnteraApp.Api.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.Abstractions.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.JsonWebTokens.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.Logging.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.Tokens.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\System.IdentityModel.Tokens.Jwt.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.AspNetCore.Authentication.JwtBearer.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.Protocols.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.IdentityModel.Protocols.OpenIdConnect.dll
