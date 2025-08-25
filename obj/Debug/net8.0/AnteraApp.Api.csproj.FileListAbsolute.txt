@@ -5,11 +5,17 @@ C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\AnteraApp.Api.dep
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\AnteraApp.Api.runtimeconfig.json
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\AnteraApp.Api.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\AnteraApp.Api.pdb
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\DnsClient.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.AspNetCore.OpenApi.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Microsoft.OpenApi.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\MongoDB.Bson.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\MongoDB.Driver.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\SharpCompress.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Snappier.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Swashbuckle.AspNetCore.Swagger.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Swashbuckle.AspNetCore.SwaggerGen.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Swashbuckle.AspNetCore.SwaggerUI.dll
+C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\ZstdSharp.dll
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.csproj.AssemblyReference.cache
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.GeneratedMSBuildEditorConfig.editorconfig
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.AssemblyInfoInputs.cache
@@ -32,9 +38,3 @@ C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\refint\AnteraApp.
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.pdb
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\AnteraApp.Api.genruntimeconfig.cache
 C:\PROYECTOS\antera-app\backend\AnteraApp.Api\obj\Debug\net8.0\ref\AnteraApp.Api.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\DnsClient.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\MongoDB.Bson.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\MongoDB.Driver.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\SharpCompress.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\Snappier.dll
-C:\PROYECTOS\antera-app\backend\AnteraApp.Api\bin\Debug\net8.0\ZstdSharp.dll

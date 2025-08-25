@@ -24,6 +24,10 @@ builder.Services.AddCors(options =>
     );
 });
 
+builder.Services.Configure<JwtSettings>(
+    builder.Configuration.GetSection("Jwt"));
+
+
 
 var app = builder.Build();
 
