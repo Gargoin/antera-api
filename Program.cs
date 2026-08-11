@@ -3,7 +3,7 @@ using AnteraApp.Api.Services;
 using AnteraApp.Api.Models;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
-using Microsoft.OpenApi.Models;
+using Microsoft.OpenApi;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
 
@@ -20,23 +20,14 @@ builder.Services.AddSwaggerGen(c =>
         Description = "JWT Authorization header using the Bearer scheme. Example: 'Bearer {token}'",
         Name = "Authorization",
         In = ParameterLocation.Header,
-        Type = SecuritySchemeType.ApiKey,
-        Scheme = "Bearer"
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT"
     });
 
-    c.AddSecurityRequirement(new OpenApiSecurityRequirement
+    c.AddSecurityRequirement(document => new OpenApiSecurityRequirement
     {
-        {
-            new OpenApiSecurityScheme
-            {
-                Reference = new OpenApiReference
-                {
-                    Type = ReferenceType.SecurityScheme,
-                    Id = "Bearer"
-                }
-            },
-            new string[] {}
-        }
+        [new OpenApiSecuritySchemeReference("Bearer", document)] = []
     });
 });
 
@@ -92,8 +83,29 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 // Swagger
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/swagger") ||
+        context.Request.Path.StartsWithSegments("/api-docs"))
+    {
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers.CacheControl = "no-store, no-cache";
+            context.Response.Headers.Pragma = "no-cache";
+            context.Response.Headers.Expires = "0";
+            return Task.CompletedTask;
+        });
+    }
+
+    await next();
+});
+
 app.UseSwagger();
-app.UseSwaggerUI();
+app.UseSwaggerUI(options =>
+{
+    options.RoutePrefix = "api-docs";
+    options.SwaggerEndpoint("/swagger/v1/swagger.json?v=net10", "AnteraApp.Api v1");
+});
 
 app.UseHttpsRedirection();
 
@@ -103,16 +115,14 @@ app.MapGet("/api/antera", [Authorize] async (AnteraService anteraService) =>
     var readings = await anteraService.GetAsync();
     return Results.Ok(readings);
 })
-.WithName("GetAnteraReadings")
-.WithOpenApi();
+.WithName("GetAnteraReadings");
 
 app.MapPost("/api/antera", async (AnteraService anteraService, AnteraReading newReading) =>
 {
     await anteraService.CreateAsync(newReading);
     return Results.Created($"/api/antera/{newReading.Id}", newReading);
 })
-.WithName("CreateAnteraReading")
-.WithOpenApi();
+.WithName("CreateAnteraReading");
 
 app.MapPost("/api/auth/register", async (AuthService authService, RegisterRequest request) =>
 {
@@ -122,8 +132,7 @@ app.MapPost("/api/auth/register", async (AuthService authService, RegisterReques
 
     return Results.Ok("User registered successfully.");
 })
-.WithName("RegisterUser")
-.WithOpenApi();
+.WithName("RegisterUser");
 
 app.MapPost("/api/auth/login", async (AuthService authService, LoginRequest request) =>
 {
@@ -133,16 +142,14 @@ app.MapPost("/api/auth/login", async (AuthService authService, LoginRequest requ
 
     return Results.Ok(new AuthResponse { Token = token });
 })
-.WithName("LoginUser")
-.WithOpenApi();
+.WithName("LoginUser");
 
 // Ruta protegida por JWT
 app.MapGet("/api/protected", [Authorize]() =>
 {
     return Results.Ok("Access granted to protected route.");
 })
-.WithName("ProtectedRoute")
-.WithOpenApi();
+.WithName("ProtectedRoute");
 
 app.Run();
 
