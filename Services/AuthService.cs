@@ -1,86 +1,105 @@
 using AnteraApp.Api.Models;
+using AnteraApp.Api.Settings;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.IdentityModel.Tokens;
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Claims;
-using AnteraApp.Api.Settings;
-
 
 namespace AnteraApp.Api.Services
 {
     public class AuthService
     {
-        private readonly IMongoCollection<User> _users;
-        private readonly string _jwtSecret;
+        private const int LegacySha256HashSize = 32;
 
-        public AuthService(IOptions<MongoDBSettings> dbSettings, IConfiguration config)
+        private readonly IMongoCollection<User> _users;
+        private readonly IPasswordHasher<User> _passwordHasher;
+        private readonly JwtService _jwtService;
+
+        public AuthService(
+            IOptions<MongoDBSettings> dbSettings,
+            IPasswordHasher<User> passwordHasher,
+            JwtService jwtService)
         {
             var client = new MongoClient(dbSettings.Value.ConnectionString);
             var database = client.GetDatabase(dbSettings.Value.DatabaseName);
             _users = database.GetCollection<User>("Users");
-
-            _jwtSecret = config["Jwt:Secret"]!;
+            _passwordHasher = passwordHasher;
+            _jwtService = jwtService;
         }
 
-        public async Task<bool> RegisterAsync(RegisterRequest request)
+        public async Task<bool> RegisterAsync(
+            RegisterRequest request,
+            CancellationToken cancellationToken = default)
         {
-            var existing = await _users.Find(u => u.Email == request.Email).FirstOrDefaultAsync();
+            var existing = await _users
+                .Find(u => u.Email == request.Email)
+                .FirstOrDefaultAsync(cancellationToken);
+
             if (existing != null) return false;
 
             var user = new User
             {
-                Email = request.Email,
-                PasswordHash = HashPassword(request.Password)
+                Email = request.Email
             };
 
-            await _users.InsertOneAsync(user);
+            user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+            await _users.InsertOneAsync(user, cancellationToken: cancellationToken);
             return true;
         }
 
-        public async Task<string?> LoginAsync(LoginRequest request)
+        public async Task<string?> LoginAsync(
+            LoginRequest request,
+            CancellationToken cancellationToken = default)
         {
-            var user = await _users.Find(u => u.Email == request.Email).FirstOrDefaultAsync();
-            if (user == null || !VerifyPassword(request.Password, user.PasswordHash)) return null;
+            var user = await _users
+                .Find(u => u.Email == request.Email)
+                .FirstOrDefaultAsync(cancellationToken);
 
-            return GenerateJwtToken(user);
-        }
+            if (user == null) return null;
 
-        private string HashPassword(string password)
-        {
-            using var sha256 = SHA256.Create();
-            var bytes = Encoding.UTF8.GetBytes(password);
-            var hash = sha256.ComputeHash(bytes);
-            return Convert.ToBase64String(hash);
-        }
+            var verificationResult = VerifyPassword(user, request.Password);
+            if (verificationResult == PasswordVerificationResult.Failed) return null;
 
-        private bool VerifyPassword(string password, string hash)
-        {
-            return HashPassword(password) == hash;
-        }
-
-        private string GenerateJwtToken(User user)
-        {
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.ASCII.GetBytes(_jwtSecret);
-
-            var tokenDescriptor = new SecurityTokenDescriptor
+            if (verificationResult == PasswordVerificationResult.SuccessRehashNeeded)
             {
-                Subject = new ClaimsIdentity(new[]
-                {
-                    new Claim(ClaimTypes.NameIdentifier, user.Id!),
-                    new Claim(ClaimTypes.Email, user.Email)
-                }),
-                Expires = DateTime.UtcNow.AddHours(1),
-                SigningCredentials = new SigningCredentials(
-                    new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature
-                )
-            };
+                user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
 
-            var token = tokenHandler.CreateToken(tokenDescriptor);
-            return tokenHandler.WriteToken(token);
+                await _users.UpdateOneAsync(
+                    candidate => candidate.Id == user.Id,
+                    Builders<User>.Update.Set(candidate => candidate.PasswordHash, user.PasswordHash),
+                    cancellationToken: cancellationToken);
+            }
+
+            return _jwtService.GenerateToken(user);
+        }
+
+        private PasswordVerificationResult VerifyPassword(User user, string password)
+        {
+            if (TryDecodeLegacyHash(user.PasswordHash, out var legacyHash))
+            {
+                var candidateHash = SHA256.HashData(Encoding.UTF8.GetBytes(password));
+                return CryptographicOperations.FixedTimeEquals(candidateHash, legacyHash)
+                    ? PasswordVerificationResult.SuccessRehashNeeded
+                    : PasswordVerificationResult.Failed;
+            }
+
+            return _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, password);
+        }
+
+        private static bool TryDecodeLegacyHash(string passwordHash, out byte[] decodedHash)
+        {
+            try
+            {
+                decodedHash = Convert.FromBase64String(passwordHash);
+                return decodedHash.Length == LegacySha256HashSize;
+            }
+            catch (FormatException)
+            {
+                decodedHash = [];
+                return false;
+            }
         }
     }
 }

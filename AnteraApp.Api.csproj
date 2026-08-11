@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>antera-app-api-7a21cd19-9077-41be-99fc-f12bb022535c</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>

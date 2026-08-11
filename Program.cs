@@ -2,6 +2,7 @@ using AnteraApp.Api.Settings;
 using AnteraApp.Api.Services;
 using AnteraApp.Api.Models;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
 using System.Text;
@@ -31,19 +32,48 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
-builder.Services.Configure<MongoDBSettings>(
-    builder.Configuration.GetSection("MongoDB"));
+builder.Services.AddOptions<MongoDBSettings>()
+    .BindConfiguration(MongoDBSettings.SectionName)
+    .Validate(settings => !string.IsNullOrWhiteSpace(settings.ConnectionString),
+        "MongoDB:ConnectionString is required. Configure it outside source control.")
+    .Validate(settings => !string.IsNullOrWhiteSpace(settings.DatabaseName),
+        "MongoDB:DatabaseName is required.")
+    .ValidateOnStart();
 
-builder.Services.Configure<JwtSettings>(
-    builder.Configuration.GetSection("Jwt"));
+builder.Services.AddOptions<JwtSettings>()
+    .BindConfiguration(JwtSettings.SectionName)
+    .Validate(settings => Encoding.UTF8.GetByteCount(settings.Secret) >= 32,
+        "Jwt:Secret must contain at least 32 bytes and must be configured outside source control.")
+    .Validate(settings => !string.IsNullOrWhiteSpace(settings.Issuer),
+        "Jwt:Issuer is required.")
+    .Validate(settings => !string.IsNullOrWhiteSpace(settings.Audience),
+        "Jwt:Audience is required.")
+    .Validate(settings => settings.ExpirationMinutes is >= 5 and <= 1440,
+        "Jwt:ExpirationMinutes must be between 5 and 1440.")
+    .ValidateOnStart();
+
+var jwtSettings = builder.Configuration
+    .GetRequiredSection(JwtSettings.SectionName)
+    .Get<JwtSettings>()
+    ?? throw new InvalidOperationException("JWT configuration is required.");
+
+if (Encoding.UTF8.GetByteCount(jwtSettings.Secret) < 32)
+{
+    throw new InvalidOperationException(
+        "Jwt:Secret must contain at least 32 bytes and must be configured outside source control.");
+}
 
 builder.Services.AddSingleton<AnteraService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JwtService>();
+builder.Services.Configure<PasswordHasherOptions>(options =>
+{
+    options.IterationCount = 210_000;
+});
+builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
 
 // JWT authentication setup
-var jwtKey = builder.Configuration["Jwt:Secret"];
-var key = Encoding.ASCII.GetBytes(jwtKey!);
+var key = Encoding.UTF8.GetBytes(jwtSettings.Secret);
 
 builder.Services.AddAuthentication(options =>
 {
@@ -58,8 +88,12 @@ builder.Services.AddAuthentication(options =>
     {
         ValidateIssuerSigningKey = true,
         IssuerSigningKey = new SymmetricSecurityKey(key),
-        ValidateIssuer = false,
-        ValidateAudience = false
+        ValidateIssuer = true,
+        ValidIssuer = jwtSettings.Issuer,
+        ValidateAudience = true,
+        ValidAudience = jwtSettings.Audience,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromMinutes(1)
     };
 });
 
@@ -122,11 +156,15 @@ app.MapPost("/api/antera", async (AnteraService anteraService, AnteraReading new
     await anteraService.CreateAsync(newReading);
     return Results.Created($"/api/antera/{newReading.Id}", newReading);
 })
+.RequireAuthorization()
 .WithName("CreateAnteraReading");
 
-app.MapPost("/api/auth/register", async (AuthService authService, RegisterRequest request) =>
+app.MapPost("/api/auth/register", async (
+    AuthService authService,
+    RegisterRequest request,
+    CancellationToken cancellationToken) =>
 {
-    var success = await authService.RegisterAsync(request);
+    var success = await authService.RegisterAsync(request, cancellationToken);
     if (!success)
         return Results.BadRequest("User already exists.");
 
@@ -134,9 +172,12 @@ app.MapPost("/api/auth/register", async (AuthService authService, RegisterReques
 })
 .WithName("RegisterUser");
 
-app.MapPost("/api/auth/login", async (AuthService authService, LoginRequest request) =>
+app.MapPost("/api/auth/login", async (
+    AuthService authService,
+    LoginRequest request,
+    CancellationToken cancellationToken) =>
 {
-    var token = await authService.LoginAsync(request);
+    var token = await authService.LoginAsync(request, cancellationToken);
     if (token == null)
         return Results.Unauthorized();
 
