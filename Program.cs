@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -66,6 +67,29 @@ if (Encoding.UTF8.GetByteCount(jwtSettings.Secret) < 32)
 builder.Services.AddSingleton<AnteraService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JwtService>();
+builder.Services.AddMemoryCache();
+builder.Services.AddHttpClient<PollenService>(client =>
+{
+    client.BaseAddress = new Uri("https://air-quality-api.open-meteo.com/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+builder.Services.AddHttpClient<MadridPollenService>(client =>
+{
+    client.BaseAddress = new Uri("https://datos.comunidad.madrid/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+builder.Services.AddHttpClient<CastillaLeonPollenService>(client =>
+{
+    client.BaseAddress = new Uri("https://analisis.datosabiertos.jcyl.es/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+builder.Services.AddHttpClient<LocationService>(client =>
+{
+    client.BaseAddress = new Uri("https://nominatim.openstreetmap.org/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd(
+        "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
+});
 builder.Services.Configure<PasswordHasherOptions>(options =>
 {
     options.IterationCount = 210_000;
@@ -158,6 +182,36 @@ app.MapPost("/api/antera", async (AnteraService anteraService, AnteraReading new
 })
 .RequireAuthorization()
 .WithName("CreateAnteraReading");
+
+app.MapGet("/api/pollen/current", async (
+    double latitude,
+    double longitude,
+    PollenService pollenService,
+    CancellationToken cancellationToken) =>
+{
+    if (latitude is < -90 or > 90 || longitude is < -180 or > 180)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["coordinates"] = ["Las coordenadas indicadas no son válidas."]
+        });
+    }
+
+    try
+    {
+        var reading = await pollenService.GetCurrentAsync(latitude, longitude, cancellationToken);
+        return Results.Ok(reading);
+    }
+    catch (Exception exception) when (
+        exception is HttpRequestException or JsonException or InvalidOperationException)
+    {
+        return Results.Problem(
+            title: "No se han podido obtener los datos de polen.",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+})
+.RequireAuthorization()
+.WithName("GetCurrentPollen");
 
 app.MapPost("/api/auth/register", async (
     AuthService authService,
