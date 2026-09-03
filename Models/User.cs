@@ -14,5 +14,8 @@ namespace AnteraApp.Api.Models
 
         [BsonElement("passwordHash")]
         public string PasswordHash { get; set; } = null!;
+
+        [BsonElement("favoritePollenTypes")]
+        public List<string> FavoritePollenTypes { get; set; } = [];
     }
 }

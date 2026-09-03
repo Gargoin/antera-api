@@ -1,20 +1,6 @@
 @AnteraApp.Api_HostAddress = http://localhost:5212
 @Token = paste-a-valid-token-here
 
-GET {{AnteraApp.Api_HostAddress}}/api/antera
+GET {{AnteraApp.Api_HostAddress}}/api/pollen/current?latitude=40.4168&longitude=-3.7038
 Accept: application/json
 Authorization: Bearer {{Token}}
-
-###
-
-POST {{AnteraApp.Api_HostAddress}}/api/antera
-Content-Type: application/json
-Authorization: Bearer {{Token}}
-
-{
-  "date": "2026-08-11T12:00:00Z",
-  "location": "Madrid",
-  "level": 3
-}
-
-###

@@ -28,7 +28,7 @@ namespace AnteraApp.Api.Services
             _jwtService = jwtService;
         }
 
-        public async Task<bool> RegisterAsync(
+        public async Task<string?> RegisterAsync(
             RegisterRequest request,
             CancellationToken cancellationToken = default)
         {
@@ -36,7 +36,7 @@ namespace AnteraApp.Api.Services
                 .Find(u => u.Email == request.Email)
                 .FirstOrDefaultAsync(cancellationToken);
 
-            if (existing != null) return false;
+            if (existing != null) return null;
 
             var user = new User
             {
@@ -46,7 +46,7 @@ namespace AnteraApp.Api.Services
             user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
 
             await _users.InsertOneAsync(user, cancellationToken: cancellationToken);
-            return true;
+            return _jwtService.GenerateToken(user);
         }
 
         public async Task<string?> LoginAsync(

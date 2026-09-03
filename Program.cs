@@ -64,9 +64,9 @@ if (Encoding.UTF8.GetByteCount(jwtSettings.Secret) < 32)
         "Jwt:Secret must contain at least 32 bytes and must be configured outside source control.");
 }
 
-builder.Services.AddSingleton<AnteraService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JwtService>();
+builder.Services.AddSingleton<PollenPreferencesService>();
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient<PollenService>(client =>
 {
@@ -89,6 +89,11 @@ builder.Services.AddHttpClient<LocationService>(client =>
     client.Timeout = TimeSpan.FromSeconds(15);
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
         "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
+});
+builder.Services.AddHttpClient("SpanishLocationAutocomplete", client =>
+{
+    client.BaseAddress = new Uri("https://www.cartociudad.es/geocoder/api/geocoder/");
+    client.Timeout = TimeSpan.FromSeconds(10);
 });
 builder.Services.Configure<PasswordHasherOptions>(options =>
 {
@@ -167,21 +172,33 @@ app.UseSwaggerUI(options =>
 
 app.UseHttpsRedirection();
 
-// Rutas API
-app.MapGet("/api/antera", [Authorize] async (AnteraService anteraService) =>
+app.MapGet("/api/locations/search", async (
+    string query,
+    LocationService locationService,
+    CancellationToken cancellationToken) =>
 {
-    var readings = await anteraService.GetAsync();
-    return Results.Ok(readings);
-})
-.WithName("GetAnteraReadings");
+    if (string.IsNullOrWhiteSpace(query) || query.Trim().Length is < 2 or > 80)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["query"] = ["Escribe entre 2 y 80 caracteres para buscar una localidad."]
+        });
+    }
 
-app.MapPost("/api/antera", async (AnteraService anteraService, AnteraReading newReading) =>
-{
-    await anteraService.CreateAsync(newReading);
-    return Results.Created($"/api/antera/{newReading.Id}", newReading);
+    try
+    {
+        var locations = await locationService.SearchSpanishSettlementsAsync(query, cancellationToken);
+        return Results.Ok(locations);
+    }
+    catch (Exception exception) when (exception is HttpRequestException or JsonException)
+    {
+        return Results.Problem(
+            title: "No se han podido buscar localidades ahora mismo.",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
 })
 .RequireAuthorization()
-.WithName("CreateAnteraReading");
+.WithName("SearchSpanishLocations");
 
 app.MapGet("/api/pollen/current", async (
     double latitude,
@@ -213,16 +230,65 @@ app.MapGet("/api/pollen/current", async (
 .RequireAuthorization()
 .WithName("GetCurrentPollen");
 
+app.MapGet("/api/pollen/types", () => Results.Ok(PollenCatalog.Types))
+    .RequireAuthorization()
+    .WithName("GetPollenTypes");
+
+app.MapGet("/api/user/pollen-preferences", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    PollenPreferencesService preferencesService,
+    CancellationToken cancellationToken) =>
+{
+    var userId = user.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+        ?? user.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+    if (string.IsNullOrWhiteSpace(userId)) return Results.Unauthorized();
+
+    var preferences = await preferencesService.GetAsync(userId, cancellationToken);
+    return preferences is null ? Results.Unauthorized() : Results.Ok(preferences);
+})
+.RequireAuthorization()
+.WithName("GetPollenPreferences");
+
+app.MapPut("/api/user/pollen-preferences", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    UpdatePollenPreferencesRequest request,
+    PollenPreferencesService preferencesService,
+    CancellationToken cancellationToken) =>
+{
+    var userId = user.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+        ?? user.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+    if (string.IsNullOrWhiteSpace(userId)) return Results.Unauthorized();
+
+    var pollenTypeIds = request.PollenTypeIds?
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    if (pollenTypeIds is null || pollenTypeIds.Length > PollenCatalog.Types.Count ||
+        pollenTypeIds.Any(id => !PollenCatalog.Contains(id)))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["pollenTypeIds"] = ["Los pólenes seleccionados no son válidos."]
+        });
+    }
+
+    var preferences = await preferencesService.UpdateAsync(userId, pollenTypeIds, cancellationToken);
+    return preferences is null ? Results.Unauthorized() : Results.Ok(preferences);
+})
+.RequireAuthorization()
+.WithName("UpdatePollenPreferences");
+
 app.MapPost("/api/auth/register", async (
     AuthService authService,
     RegisterRequest request,
     CancellationToken cancellationToken) =>
 {
-    var success = await authService.RegisterAsync(request, cancellationToken);
-    if (!success)
+    var token = await authService.RegisterAsync(request, cancellationToken);
+    if (token is null)
         return Results.BadRequest("User already exists.");
 
-    return Results.Ok("User registered successfully.");
+    return Results.Created("/api/user/pollen-preferences", new AuthResponse { Token = token });
 })
 .WithName("RegisterUser");
 

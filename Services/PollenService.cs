@@ -37,7 +37,7 @@ public sealed class PollenService(
                     locationContext.DisplayName,
                     latitude,
                     longitude,
-                    regionalReading.Species,
+                    PollenAllergyLevelClassifier.Classify(PollenCatalog.NormalizeSpecies(regionalReading.Species)),
                     "Comunidad de Madrid — Datos abiertos PALINOCAM",
                     "Medición regional",
                     regionalReading.Station,
@@ -60,7 +60,7 @@ public sealed class PollenService(
                     locationContext.DisplayName,
                     latitude,
                     longitude,
-                    regionalReading.Species,
+                    PollenAllergyLevelClassifier.Classify(PollenCatalog.NormalizeSpecies(regionalReading.Species)),
                     "Junta de Castilla y León — Datos abiertos",
                     "Información regional",
                     regionalReading.Station,
@@ -84,14 +84,14 @@ public sealed class PollenService(
 
         var root = document.RootElement;
         var current = root.GetProperty("current");
-        var species = PollenTypes
+        var species = PollenAllergyLevelClassifier.Classify(PollenCatalog.NormalizeSpecies(PollenTypes
             .Where(type => current.TryGetProperty(type.ApiName, out var value) && value.ValueKind == JsonValueKind.Number)
             .Select(type => new PollenSpeciesDto(
                 type.DisplayName,
                 current.GetProperty(type.ApiName).GetDouble(),
                 "granos/m³"))
             .OrderByDescending(type => type.Value)
-            .ToArray();
+            .ToArray()));
 
         var time = current.GetProperty("time").GetString();
         if (!DateTime.TryParse(time, CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
