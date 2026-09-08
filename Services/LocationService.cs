@@ -24,11 +24,11 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
     // Sus coordenadas son puntos de referencia para obtener la lectura ambiental de la isla.
     private static readonly IReadOnlyList<LocationSuggestionDto> BalearicIslandSuggestions =
     [
-        new("Mallorca, Islas Baleares", 39.7104, 2.9951),
-        new("Menorca, Islas Baleares", 39.9496, 4.1104),
-        new("Ibiza, Islas Baleares", 38.9800, 1.4300),
-        new("Formentera, Islas Baleares", 38.6950, 1.4530),
-        new("Islas Baleares", 39.5500, 2.9000)
+        new("Mallorca", "Islas Baleares", 39.7104, 2.9951),
+        new("Menorca", "Islas Baleares", 39.9496, 4.1104),
+        new("Ibiza", "Islas Baleares", 38.9800, 1.4300),
+        new("Formentera", "Islas Baleares", 38.6950, 1.4530),
+        new("Islas Baleares", null, 39.5500, 2.9000)
     ];
 
     public async Task<string> GetNearestSettlementAsync(
@@ -198,11 +198,11 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
         }
 
         var region = GetFirstValue(candidate, "comunidadAutonoma", "province");
-        var name = string.IsNullOrWhiteSpace(region) ||
-                   string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
-            ? settlement
-            : $"{settlement}, {region}";
-        return new LocationCandidate(id, type, name);
+        var province = string.IsNullOrWhiteSpace(region) ||
+                       string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
+            ? null
+            : region;
+        return new LocationCandidate(id, type, settlement, province);
     }
 
     private static async Task<LocationSuggestionDto?> ResolveCandidateAsync(
@@ -222,7 +222,7 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
 
         return TryGetCoordinateProperty(result, "lat", out var latitude) &&
                TryGetCoordinateProperty(result, "lng", out var longitude)
-            ? new LocationSuggestionDto(candidate.Name, latitude, longitude)
+            ? new LocationSuggestionDto(candidate.Name, candidate.Province, latitude, longitude)
             : null;
     }
 
@@ -291,7 +291,7 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
     }
 }
 
-internal sealed record LocationCandidate(string Id, string Type, string Name);
+internal sealed record LocationCandidate(string Id, string Type, string Name, string? Province);
 
 public sealed record LocationContext(string DisplayName, string? Region)
 {
