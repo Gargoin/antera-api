@@ -77,10 +77,18 @@ builder.Services.AddHttpClient<MadridPollenService>(client =>
 {
     client.BaseAddress = new Uri("https://datos.comunidad.madrid/");
     client.Timeout = TimeSpan.FromSeconds(15);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd(
+        "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
+    client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
 });
 builder.Services.AddHttpClient<CastillaLeonPollenService>(client =>
 {
     client.BaseAddress = new Uri("https://analisis.datosabiertos.jcyl.es/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+builder.Services.AddHttpClient<CataloniaPollenService>(client =>
+{
+    client.BaseAddress = new Uri("https://aerobiologia.cat/");
     client.Timeout = TimeSpan.FromSeconds(15);
 });
 builder.Services.AddHttpClient<LocationService>(client =>

@@ -8,7 +8,9 @@ public sealed class PollenService(
     HttpClient httpClient,
     LocationService locationService,
     MadridPollenService madridPollenService,
-    CastillaLeonPollenService castillaLeonPollenService)
+    CastillaLeonPollenService castillaLeonPollenService,
+    CataloniaPollenService cataloniaPollenService,
+    ILogger<PollenService> logger)
 {
     private static readonly (string ApiName, string DisplayName)[] PollenTypes =
     [
@@ -26,7 +28,7 @@ public sealed class PollenService(
         CancellationToken cancellationToken)
     {
         var locationContext = await TryGetLocationContextAsync(latitude, longitude, cancellationToken);
-        if (IsMadrid(locationContext.Region))
+        if (IsMadrid(locationContext.Region, latitude, longitude))
         {
             try
             {
@@ -45,7 +47,7 @@ public sealed class PollenService(
             }
             catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidOperationException)
             {
-                // Si la fuente regional está temporalmente disponible, se mantiene la cobertura con el modelo ambiental.
+                logger.LogWarning(exception, "No se pudo obtener la lectura regional de PALINOCAM.");
             }
         }
 
@@ -69,6 +71,29 @@ public sealed class PollenService(
             catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidOperationException)
             {
                 // Si la fuente regional no responde, se mantiene la cobertura con el modelo ambiental.
+            }
+        }
+
+        if (IsCatalonia(locationContext.Region, latitude, longitude))
+        {
+            try
+            {
+                var regionalReading = await cataloniaPollenService.GetCurrentAsync(latitude, longitude, cancellationToken);
+                return new PollenReadingDto(
+                    regionalReading.Date,
+                    "Europe/Madrid",
+                    locationContext.DisplayName,
+                    latitude,
+                    longitude,
+                    regionalReading.Species,
+                    "Xarxa Aerobiològica de Catalunya (XAC)",
+                    "Información regional",
+                    regionalReading.Station,
+                    "Niveles y previsiones semanales de la XAC. Fuente bajo licencia CC BY-NC-SA 4.0.");
+            }
+            catch (Exception exception) when (exception is HttpRequestException or InvalidOperationException)
+            {
+                logger.LogWarning(exception, "No se pudo obtener la lectura regional de la XAC.");
             }
         }
 
@@ -134,14 +159,25 @@ public sealed class PollenService(
         }
     }
 
-    private static bool IsMadrid(string? region) =>
+    private static bool IsMadrid(string? region, double latitude, double longitude) =>
         string.Equals(region, "Comunidad de Madrid", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(region, "Madrid", StringComparison.OrdinalIgnoreCase);
+        string.Equals(region, "Madrid", StringComparison.OrdinalIgnoreCase) ||
+        IsWithinMadridCommunity(latitude, longitude);
+
+    // La geocodificación inversa es una mejora de contexto, no debe decidir si se
+    // utiliza una red regional. Este límite cubre la Comunidad de Madrid cuando
+    // Nominatim no responde o agota su cuota temporalmente.
+    private static bool IsWithinMadridCommunity(double latitude, double longitude) =>
+        latitude is >= 40.05 and <= 41.2 && longitude is >= -4.65 and <= -2.95;
 
     private static bool IsCanaryIslands(string? region) =>
         !string.IsNullOrWhiteSpace(region) &&
         (region.Contains("Canarias", StringComparison.OrdinalIgnoreCase) ||
          region.Contains("Canary", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsCatalonia(string? region, double latitude, double longitude) =>
+        !string.IsNullOrWhiteSpace(region) && region.Contains("Catalu", StringComparison.OrdinalIgnoreCase) ||
+        latitude is >= 40.5 and <= 42.9 && longitude is >= 0.1 and <= 3.4;
 
     private static bool IsCastillaLeon(string? region) =>
         !string.IsNullOrWhiteSpace(region) &&
