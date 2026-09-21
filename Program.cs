@@ -98,11 +98,6 @@ builder.Services.AddHttpClient<LocationService>(client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
         "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
 });
-builder.Services.AddHttpClient("SpanishLocationAutocomplete", client =>
-{
-    client.BaseAddress = new Uri("https://www.cartociudad.es/geocoder/api/geocoder/");
-    client.Timeout = TimeSpan.FromSeconds(10);
-});
 builder.Services.Configure<PasswordHasherOptions>(options =>
 {
     options.IterationCount = 210_000;

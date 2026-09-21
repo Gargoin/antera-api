@@ -6,7 +6,7 @@ using System.Text.Json;
 
 namespace AnteraApp.Api.Services;
 
-public sealed class LocationService(HttpClient httpClient, IHttpClientFactory httpClientFactory, IMemoryCache cache)
+public sealed class LocationService(HttpClient httpClient, IMemoryCache cache)
 {
     private static readonly SemaphoreSlim RequestGate = new(1, 1);
     private static DateTimeOffset _nextRequestAt = DateTimeOffset.MinValue;
@@ -18,8 +18,12 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
             ["islas baleares"] = "Illes Balears, España",
             ["illes balears"] = "Illes Balears, España"
         };
-    private static readonly HashSet<string> LocationTypes =
-        ["municipio", "poblacion", "toponimo", "comunidad autonoma", "provincia", "isla"];
+    private static readonly HashSet<string> SearchStopWords =
+        ["de", "del", "la", "las", "el", "los", "y"];
+    private static readonly HashSet<string> SettlementPlaceTypes =
+        ["city", "town", "village", "hamlet"];
+    private static readonly HashSet<string> SettlementAdministrativeTypes =
+        ["city", "town", "village", "hamlet", "municipality", "city_district"];
     // Las islas no siempre se catalogan como municipio por los geocodificadores.
     // Sus coordenadas son puntos de referencia para obtener la lectura ambiental de la isla.
     private static readonly IReadOnlyList<LocationSuggestionDto> BalearicIslandSuggestions =
@@ -70,15 +74,21 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
             return curatedSuggestions;
         }
 
-        var cacheKey = $"location-search:{normalizedQuery.ToUpperInvariant()}";
-
-        var suggestions = await cache.GetOrCreateAsync(cacheKey, async entry =>
+        // No se persisten respuestas vacías: el proveedor puede completar su índice más tarde
+        // y una búsqueda temporalmente sin candidatos no debe ocultar ubicaciones durante horas.
+        var cacheKey = $"location-search:v5:{normalizedQuery.ToUpperInvariant()}";
+        if (cache.TryGetValue<IReadOnlyList<LocationSuggestionDto>>(cacheKey, out var cachedSuggestions))
         {
-            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(12);
-            return await ResolveSpanishSettlementsAsync(normalizedQuery, cancellationToken);
-        });
+            return cachedSuggestions;
+        }
 
-        return suggestions ?? [];
+        var suggestions = await ResolveSpanishSettlementsAsync(normalizedQuery, cancellationToken);
+        if (suggestions.Count > 0)
+        {
+            cache.Set(cacheKey, suggestions, TimeSpan.FromHours(12));
+        }
+
+        return suggestions;
     }
 
     private async Task<LocationContext> ResolveLocationContextAsync(
@@ -141,88 +151,86 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
         // Se busca con el alias oficial, pero se filtra con lo que escribió la persona.
         // Así "Mallorca" no exige que el resultado incluya también "Illes Balears, España".
         var comparisonQuery = normalizedQuery;
-        var requestUri = $"candidates?q={Uri.EscapeDataString(searchQuery)}&limit=10";
-
-        using var autocompleteClient = httpClientFactory.CreateClient("SpanishLocationAutocomplete");
-        using var response = await autocompleteClient.GetAsync(requestUri, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        await RequestGate.WaitAsync(cancellationToken);
+        try
         {
-            return [];
-        }
-
-        var candidates = document.RootElement
-            .EnumerateArray()
-            .Select(ToLocationCandidate)
-            .Where(candidate => candidate is not null)
-            .Select(candidate => candidate!)
-            .Where(candidate => IsRelevantToQuery(candidate.Name, comparisonQuery))
-            .GroupBy(candidate => NormalizeSearchTerm(candidate.Name))
-            .Select(group => group.First())
-            .OrderByDescending(candidate => NormalizeSearchTerm(candidate.Name).StartsWith(comparisonQuery, StringComparison.Ordinal))
-            .ThenBy(candidate => candidate.Name, StringComparer.CurrentCultureIgnoreCase)
-            .Take(6)
-            .ToArray();
-
-        var suggestions = new List<LocationSuggestionDto>(candidates.Length);
-        foreach (var candidate in candidates)
-        {
-            var suggestion = await ResolveCandidateAsync(autocompleteClient, candidate, cancellationToken);
-            if (suggestion is not null)
+            var delay = _nextRequestAt - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
             {
-                suggestions.Add(suggestion);
+                await Task.Delay(delay, cancellationToken);
             }
-        }
 
-        return suggestions;
+            _nextRequestAt = DateTimeOffset.UtcNow.AddSeconds(1);
+            var requestUri = $"search?format=jsonv2&addressdetails=1&countrycodes=es&limit=10&accept-language=es&q={Uri.EscapeDataString(searchQuery)}";
+            using var response = await httpClient.GetAsync(requestUri, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            return document.RootElement
+                .EnumerateArray()
+                .Select(ToSettlementSuggestion)
+                .Where(suggestion => suggestion is not null)
+                .Select(suggestion => suggestion!)
+                .Where(suggestion => IsRelevantToQuery(suggestion.SearchText, comparisonQuery))
+                .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
+                .Select(group => group.First())
+                .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name).StartsWith(comparisonQuery, StringComparison.Ordinal))
+                .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Take(6)
+                .Select(suggestion => new LocationSuggestionDto(
+                    suggestion.Name, suggestion.Province, suggestion.Latitude, suggestion.Longitude))
+                .ToArray();
+        }
+        finally
+        {
+            RequestGate.Release();
+        }
     }
 
-    private static LocationCandidate? ToLocationCandidate(JsonElement candidate)
+    private static SettlementSuggestion? ToSettlementSuggestion(JsonElement result)
     {
-        var type = GetFirstValue(candidate, "type");
-        var id = GetFirstValue(candidate, "id");
-        if (string.IsNullOrWhiteSpace(type) ||
-            string.IsNullOrWhiteSpace(id) ||
-            !LocationTypes.Contains(NormalizeSearchTerm(type.Replace('_', ' '))))
+        var category = GetFirstValue(result, "category");
+        var type = GetFirstValue(result, "type");
+        var addressType = GetFirstValue(result, "addresstype");
+        var isPlace = string.Equals(category, "place", StringComparison.OrdinalIgnoreCase) &&
+                      type is not null && SettlementPlaceTypes.Contains(type);
+        var isAdministrativeSettlement =
+            string.Equals(category, "boundary", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(type, "administrative", StringComparison.OrdinalIgnoreCase) &&
+            addressType is not null && SettlementAdministrativeTypes.Contains(addressType);
+        if (!isPlace && !isAdministrativeSettlement)
         {
             return null;
         }
 
-        var settlement = GetFirstValue(candidate, "muni", "poblacion", "address");
+        var settlement = GetFirstValue(result, "name");
         if (string.IsNullOrWhiteSpace(settlement))
         {
             return null;
         }
 
-        var region = GetFirstValue(candidate, "comunidadAutonoma", "province");
+        if (!result.TryGetProperty("address", out var address))
+        {
+            return null;
+        }
+
+        var municipality = GetFirstValue(address, "city", "town", "village", "municipality", "county");
+        var region = GetFirstValue(address, "state", "province", "region", "county");
         var province = string.IsNullOrWhiteSpace(region) ||
                        string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
             ? null
             : region;
-        return new LocationCandidate(id, type, settlement, province);
-    }
-
-    private static async Task<LocationSuggestionDto?> ResolveCandidateAsync(
-        HttpClient autocompleteClient,
-        LocationCandidate candidate,
-        CancellationToken cancellationToken)
-    {
-        var requestUri = $"find?type={Uri.EscapeDataString(candidate.Type)}&id={Uri.EscapeDataString(candidate.Id)}";
-        using var response = await autocompleteClient.GetAsync(requestUri, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-        var result = document.RootElement.ValueKind == JsonValueKind.Array
-            ? document.RootElement.EnumerateArray().FirstOrDefault()
-            : document.RootElement;
-
+        var searchText = string.Join(' ', new[] { settlement, municipality }
+            .Where(value => !string.IsNullOrWhiteSpace(value)));
         return TryGetCoordinateProperty(result, "lat", out var latitude) &&
-               TryGetCoordinateProperty(result, "lng", out var longitude)
-            ? new LocationSuggestionDto(candidate.Name, candidate.Province, latitude, longitude)
+               TryGetCoordinateProperty(result, "lon", out var longitude)
+            ? new SettlementSuggestion(settlement, province, latitude, longitude, searchText)
             : null;
     }
 
@@ -251,13 +259,19 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
     private static bool IsRelevantToQuery(string locationName, string normalizedQuery)
     {
         var normalizedName = NormalizeSearchTerm(locationName);
+        var relevantTerms = normalizedQuery
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(term => !SearchStopWords.Contains(term))
+            .ToArray();
         if (normalizedQuery is "islas baleares" or "illes balears" or "baleares")
         {
             return normalizedName.Contains("baleares", StringComparison.Ordinal);
         }
 
         return normalizedName.StartsWith(normalizedQuery, StringComparison.Ordinal) ||
-               normalizedName.Contains($" {normalizedQuery}", StringComparison.Ordinal);
+               normalizedName.Contains($" {normalizedQuery}", StringComparison.Ordinal) ||
+               (relevantTerms.Length > 0 &&
+                relevantTerms.All(term => normalizedName.Contains(term, StringComparison.Ordinal)));
     }
 
     private static bool TryGetCoordinateProperty(JsonElement result, string propertyName, out double coordinate)
@@ -291,7 +305,12 @@ public sealed class LocationService(HttpClient httpClient, IHttpClientFactory ht
     }
 }
 
-internal sealed record LocationCandidate(string Id, string Type, string Name, string? Province);
+internal sealed record SettlementSuggestion(
+    string Name,
+    string? Province,
+    double Latitude,
+    double Longitude,
+    string SearchText);
 
 public sealed record LocationContext(string DisplayName, string? Region)
 {
