@@ -12,6 +12,9 @@ namespace AnteraApp.Api.Models
         [BsonElement("email")]
         public string Email { get; set; } = null!;
 
+        [BsonElement("name")]
+        public string Name { get; set; } = null!;
+
         [BsonElement("passwordHash")]
         public string PasswordHash { get; set; } = null!;
 

@@ -43,7 +43,8 @@ namespace AnteraApp.Api.Services
 
             var user = new User
             {
-                Email = request.Email
+                Email = request.Email,
+                Name = request.Name
             };
 
             user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
@@ -136,6 +137,63 @@ namespace AnteraApp.Api.Services
             await _users.UpdateOneAsync(filter, update, cancellationToken: cancellationToken);
         }
 
+        public async Task<UserProfileResponse?> GetProfileAsync(string userId, CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
+            return user is null ? null : ToUserProfileResponse(user);
+        }
+
+        public async Task<UserProfileResponse?> UpdateNameAsync(string userId, string name, CancellationToken cancellationToken)
+        {
+            var result = await _users.FindOneAndUpdateAsync(
+                candidate => candidate.Id == userId,
+                Builders<User>.Update.Set(candidate => candidate.Name, name),
+                new FindOneAndUpdateOptions<User> { ReturnDocument = ReturnDocument.After },
+                cancellationToken);
+
+            return result is null ? null : ToUserProfileResponse(result);
+        }
+
+        public async Task<UserProfileResponse?> UpdateEmailAsync(
+            string userId,
+            string email,
+            string currentPassword,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
+            if (user is null || VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return null;
+
+            var existing = await _users.Find(candidate => candidate.Email == email && candidate.Id != userId)
+                .FirstOrDefaultAsync(cancellationToken);
+            if (existing is not null) return null;
+
+            var result = await _users.FindOneAndUpdateAsync(
+                candidate => candidate.Id == userId,
+                Builders<User>.Update.Set(candidate => candidate.Email, email),
+                new FindOneAndUpdateOptions<User> { ReturnDocument = ReturnDocument.After },
+                cancellationToken);
+
+            return result is null ? null : ToUserProfileResponse(result);
+        }
+
+        public async Task<bool?> UpdatePasswordAsync(
+            string userId,
+            string currentPassword,
+            string newPassword,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
+            if (user is null) return null;
+            if (VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return false;
+
+            user.PasswordHash = _passwordHasher.HashPassword(user, newPassword);
+            await _users.UpdateOneAsync(
+                candidate => candidate.Id == userId,
+                Builders<User>.Update.Set(candidate => candidate.PasswordHash, user.PasswordHash),
+                cancellationToken: cancellationToken);
+            return true;
+        }
+
         private async Task<AuthSession> CreateSessionAsync(
             User user,
             bool rememberMe,
@@ -180,6 +238,14 @@ namespace AnteraApp.Api.Services
 
         private static string HashToken(string token) =>
             Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+
+        private static UserProfileResponse ToUserProfileResponse(User user)
+        {
+            var name = string.IsNullOrWhiteSpace(user.Name)
+                ? user.Email.Split('@', 2)[0]
+                : user.Name;
+            return new UserProfileResponse(name, user.Email);
+        }
 
         private PasswordVerificationResult VerifyPassword(User user, string password)
         {

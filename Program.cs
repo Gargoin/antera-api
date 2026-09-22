@@ -291,11 +291,120 @@ app.MapPut("/api/user/pollen-preferences", async (
 .RequireAuthorization()
 .WithName("UpdatePollenPreferences");
 
+app.MapGet("/api/user/profile", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    if (userId is null) return Results.Unauthorized();
+
+    var profile = await authService.GetProfileAsync(userId, cancellationToken);
+    return profile is null ? Results.Unauthorized() : Results.Ok(profile);
+})
+.RequireAuthorization()
+.WithName("GetUserProfile");
+
+app.MapPut("/api/user/profile", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    UpdateUserProfileRequest request,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    var name = request.Name?.Trim();
+    if (userId is null) return Results.Unauthorized();
+    if (string.IsNullOrWhiteSpace(name) || name.Length > 80)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["name"] = ["El nombre debe tener entre 1 y 80 caracteres."]
+        });
+    }
+
+    var profile = await authService.UpdateNameAsync(userId, name, cancellationToken);
+    return profile is null ? Results.Unauthorized() : Results.Ok(profile);
+})
+.RequireAuthorization()
+.WithName("UpdateUserProfile");
+
+app.MapPut("/api/user/email", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    UpdateUserEmailRequest request,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    var email = request.Email?.Trim().ToLowerInvariant();
+    if (userId is null) return Results.Unauthorized();
+    if (string.IsNullOrWhiteSpace(email) || email.Length > 254 || !email.Contains('@') ||
+        string.IsNullOrWhiteSpace(request.CurrentPassword))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["email"] = ["Introduce un correo electrónico válido y tu contraseña actual."],
+            ["currentPassword"] = ["Introduce tu contraseña actual."]
+        });
+    }
+
+    var profile = await authService.UpdateEmailAsync(userId, email, request.CurrentPassword, cancellationToken);
+    return profile is null
+        ? Results.BadRequest(new { message = "No se ha podido validar el cambio de correo electrónico." })
+        : Results.Ok(profile);
+})
+.RequireAuthorization()
+.WithName("UpdateUserEmail");
+
+app.MapPut("/api/user/password", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    UpdateUserPasswordRequest request,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    if (userId is null) return Results.Unauthorized();
+    if (string.IsNullOrWhiteSpace(request.CurrentPassword) ||
+        string.IsNullOrWhiteSpace(request.NewPassword) ||
+        request.NewPassword.Length is < 8 or > 128)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["password"] = ["La nueva contraseña debe tener entre 8 y 128 caracteres."]
+        });
+    }
+
+    var updated = await authService.UpdatePasswordAsync(
+        userId,
+        request.CurrentPassword,
+        request.NewPassword,
+        cancellationToken);
+    return updated switch
+    {
+        null => Results.Unauthorized(),
+        false => Results.BadRequest(new { message = "La contraseña actual no es correcta." }),
+        true => Results.NoContent()
+    };
+})
+.RequireAuthorization()
+.WithName("UpdateUserPassword");
+
 app.MapPost("/api/auth/register", async (
     AuthService authService,
     RegisterRequest request,
     CancellationToken cancellationToken) =>
 {
+    request.Name = request.Name?.Trim() ?? string.Empty;
+    request.Email = request.Email?.Trim().ToLowerInvariant() ?? string.Empty;
+    if (string.IsNullOrWhiteSpace(request.Name) || request.Name.Length > 80 ||
+        string.IsNullOrWhiteSpace(request.Email) || request.Email.Length > 254 || !request.Email.Contains('@') ||
+        string.IsNullOrWhiteSpace(request.Password) || request.Password.Length is < 8 or > 128)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["registration"] = ["Revisa el nombre, el correo y la contraseña introducidos."]
+        });
+    }
+
     var token = await authService.RegisterAsync(request, cancellationToken);
     if (token is null)
         return Results.BadRequest("User already exists.");
@@ -404,6 +513,10 @@ static void SetRefreshTokenCookie(
 
 static void DeleteRefreshTokenCookie(HttpResponse response) =>
     response.Cookies.Delete("antera_refresh", new CookieOptions { Path = "/api/auth" });
+
+static string? GetUserId(System.Security.Claims.ClaimsPrincipal user) =>
+    user.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value
+    ?? user.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
 
 record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 {

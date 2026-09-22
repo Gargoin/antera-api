@@ -17,4 +17,5 @@ public sealed record PollenSpeciesDto(
     double? Value,
     string Unit,
     string? Level = null,
-    string? AllergyLevel = null);
+    string? AllergyLevel = null,
+    string? AllergyLevelScale = null);

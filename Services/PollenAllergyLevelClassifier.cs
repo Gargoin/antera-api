@@ -6,12 +6,43 @@ namespace AnteraApp.Api.Services;
 
 public static class PollenAllergyLevelClassifier
 {
+    private sealed record AllergyLevelScale(double LowMaximum, double MediumMaximum, string Description);
+
+    private static readonly AllergyLevelScale Group1 = new(
+        15,
+        30,
+        "Se consideran valores bajos hasta 15 gr/m³, medios entre 16 y 30 gr/m³ y altos desde 31 gr/m³.");
+    private static readonly AllergyLevelScale Group2 = new(
+        25,
+        50,
+        "Se consideran valores bajos hasta 25 gr/m³, medios entre 26 y 50 gr/m³ y altos desde 51 gr/m³.");
+    private static readonly AllergyLevelScale Group2Low = new(
+        10,
+        20,
+        "Se consideran valores bajos hasta 10 gr/m³, medios entre 11 y 20 gr/m³ y altos desde 21 gr/m³.");
+    private static readonly AllergyLevelScale Group2Grass = new(
+        10,
+        50,
+        "Se consideran valores bajos hasta 10 gr/m³, medios entre 11 y 50 gr/m³ y altos desde 51 gr/m³.");
+    private static readonly AllergyLevelScale Group3 = new(
+        30,
+        50,
+        "Se consideran valores bajos hasta 30 gr/m³, medios entre 31 y 50 gr/m³ y altos desde 51 gr/m³.");
+    private static readonly AllergyLevelScale Group4 = new(
+        49.999,
+        200,
+        "Se consideran valores bajos por debajo de 50 gr/m³, medios entre 50 y 200 gr/m³ y altos por encima de 200 gr/m³.");
+
     // Umbrales de la Red Española de Aerobiología (REA), expresados en granos/m³ de 24 horas.
     public static IReadOnlyList<PollenSpeciesDto> Classify(IEnumerable<PollenSpeciesDto> species) =>
         species.Select(Classify).ToArray();
 
     private static PollenSpeciesDto Classify(PollenSpeciesDto species) =>
-        species with { AllergyLevel = GetAllergyLevel(species.Name, species.Value, species.Unit) };
+        species with
+        {
+            AllergyLevel = GetAllergyLevel(species.Name, species.Value, species.Unit),
+            AllergyLevelScale = GetAllergyLevelScale(species.Name, species.Unit)
+        };
 
     private static string? GetAllergyLevel(string name, double? value, string unit)
     {
@@ -20,38 +51,40 @@ public static class PollenAllergyLevelClassifier
             return null;
         }
 
-        var normalizedName = Normalize(name);
-        return normalizedName switch
-        {
-            // Grupo 1 REA: bajo 1-15, moderado 16-30 y alto desde 31 granos/m³.
-            var item when ContainsAny(item, "viborera", "echium", "mercurial", "mercurialis") => FromThresholds(value.Value, 16, 31),
-
-            // Grupo 2 REA: bajo 1-25, moderado 26-50 y alto desde 51 granos/m³.
-            var item when ContainsAny(item, "acedera", "rumex") => FromThresholds(value.Value, 26, 51),
-            var item when ContainsAny(item, "artemisa", "artemisia") => FromThresholds(value.Value, 26, 51),
-            var item when ContainsAny(item, "ambrosia", "ragweed", "margaritas", "asteraceas", "diente de leon", "taraxacum", "girasol", "helianthus", "brezo", "ericaceae", "rosaceas", "rosaceae") => FromThresholds(value.Value, 26, 51),
-            var item when ContainsAny(item, "amarantaceas", "amaranthaceae", "chenopodiaceae") => FromThresholds(value.Value, 10, 20),
-            var item when ContainsAny(item, "llanten", "plantago", "gramineas", "poaceae", "grass") => FromThresholds(value.Value, 10, 50),
-
-            // Grupo 3 REA: bajo 1-30, moderado 31-50 y alto desde 51 granos/m³.
-            var item when ContainsAny(item, "castano", "castanea", "chopo", "alamo", "populus", "moral", "morus", "sauce", "salix", "tilo", "tilia", "eucalipto", "myrtaceae", "aligustre", "ligustrum") => FromThresholds(value.Value, 31, 51),
-            var item when ContainsAny(item, "aliso", "alnus", "abedul", "betula", "fresno", "fraxinus") => FromThresholds(value.Value, 30, 50),
-
-            // Grupo 4 REA: bajo por debajo de 50, moderado entre 50 y 200 y alto por encima de 200 granos/m³.
-            var item when ContainsAny(item, "cipres", "cupressaceae", "cupresaceas") => FromThresholds(value.Value, 50, 200),
-            var item when ContainsAny(item, "olivo", "olea") => FromThresholds(value.Value, 50, 200),
-            var item when ContainsAny(item, "pino", "pinus") => FromThresholds(value.Value, 50, 200),
-            var item when ContainsAny(item, "platano", "platanus") => FromThresholds(value.Value, 50, 200),
-            var item when ContainsAny(item, "encina", "roble", "quercus") => FromThresholds(value.Value, 50, 200),
-            var item when ContainsAny(item, "ortiga", "parietaria", "urticaceae") => FromThresholds(value.Value, 10, 20),
-            _ => FromThresholds(value.Value, 26, 51)
-        };
+        var scale = GetScale(Normalize(name));
+        return value.Value <= scale.LowMaximum ? "Bajo" :
+            value.Value <= scale.MediumMaximum ? "Medio" :
+            "Alto";
     }
 
-    private static string FromThresholds(double value, double lowUpperLimit, double mediumUpperLimit) =>
-        value < lowUpperLimit ? "Bajo" :
-        value <= mediumUpperLimit ? "Medio" :
-        "Alto";
+    private static string? GetAllergyLevelScale(string name, string unit)
+    {
+        if (string.Equals(unit, "nivel regional", StringComparison.Ordinal))
+        {
+            return "La XAC usa una escala cualitativa: 0 Nulo, 1 Bajo, 2 Medio, 3 Alto y 4 Máximo; no publica concentración en gr/m³.";
+        }
+
+        if (string.Equals(unit, "nivel", StringComparison.Ordinal))
+        {
+            return "La red regional publica un nivel cualitativo propio; Antera lo muestra sin convertirlo a gr/m³.";
+        }
+
+        return string.Equals(unit, "granos/m³", StringComparison.Ordinal)
+            ? GetScale(Normalize(name)).Description
+            : null;
+    }
+
+    private static AllergyLevelScale GetScale(string normalizedName) => normalizedName switch
+    {
+        var item when ContainsAny(item, "viborera", "echium", "mercurial", "mercurialis") => Group1,
+        var item when ContainsAny(item, "acedera", "rumex", "artemisa", "artemisia") => Group2,
+        var item when ContainsAny(item, "ambrosia", "ragweed", "margaritas", "asteraceas", "diente de leon", "taraxacum", "girasol", "helianthus", "brezo", "ericaceae", "rosaceas", "rosaceae") => Group2,
+        var item when ContainsAny(item, "amarantaceas", "amaranthaceae", "chenopodiaceae", "ortiga", "parietaria", "urticaceae") => Group2Low,
+        var item when ContainsAny(item, "llanten", "plantago", "gramineas", "poaceae", "grass") => Group2Grass,
+        var item when ContainsAny(item, "castano", "castanea", "chopo", "alamo", "populus", "moral", "morus", "sauce", "salix", "tilo", "tilia", "eucalipto", "myrtaceae", "aligustre", "ligustrum", "aliso", "alnus", "abedul", "betula", "fresno", "fraxinus") => Group3,
+        var item when ContainsAny(item, "cipres", "cupressaceae", "cupresaceas", "olivo", "olea", "pino", "pinus", "platano", "platanus", "encina", "roble", "quercus") => Group4,
+        _ => Group2
+    };
 
     private static bool ContainsAny(string value, params string[] candidates) =>
         candidates.Any(value.Contains);

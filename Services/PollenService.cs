@@ -112,7 +112,7 @@ public sealed class PollenService(
                     locationContext.DisplayName,
                     latitude,
                     longitude,
-                    regionalReading.Species,
+                    PollenAllergyLevelClassifier.Classify(regionalReading.Species),
                     "Xarxa Aerobiològica de Catalunya (XAC)",
                     "Información regional",
                     regionalReading.Station,
