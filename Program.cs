@@ -49,8 +49,10 @@ builder.Services.AddOptions<JwtSettings>()
         "Jwt:Issuer is required.")
     .Validate(settings => !string.IsNullOrWhiteSpace(settings.Audience),
         "Jwt:Audience is required.")
-    .Validate(settings => settings.ExpirationMinutes is >= 5 and <= 1440,
-        "Jwt:ExpirationMinutes must be between 5 and 1440.")
+    .Validate(settings => settings.ExpirationMinutes is >= 5 and <= 60,
+        "Jwt:ExpirationMinutes must be between 5 and 60.")
+    .Validate(settings => settings.RefreshTokenExpirationDays is >= 1 and <= 90,
+        "Jwt:RefreshTokenExpirationDays must be between 1 and 90.")
     .ValidateOnStart();
 
 var jwtSettings = builder.Configuration
@@ -76,7 +78,7 @@ builder.Services.AddHttpClient<PollenService>(client =>
 builder.Services.AddHttpClient<MadridPollenService>(client =>
 {
     client.BaseAddress = new Uri("https://datos.comunidad.madrid/");
-    client.Timeout = TimeSpan.FromSeconds(15);
+    client.Timeout = TimeSpan.FromSeconds(5);
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
         "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
     client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
@@ -84,12 +86,12 @@ builder.Services.AddHttpClient<MadridPollenService>(client =>
 builder.Services.AddHttpClient<CastillaLeonPollenService>(client =>
 {
     client.BaseAddress = new Uri("https://analisis.datosabiertos.jcyl.es/");
-    client.Timeout = TimeSpan.FromSeconds(15);
+    client.Timeout = TimeSpan.FromSeconds(5);
 });
 builder.Services.AddHttpClient<CataloniaPollenService>(client =>
 {
     client.BaseAddress = new Uri("https://aerobiologia.cat/");
-    client.Timeout = TimeSpan.FromSeconds(15);
+    client.Timeout = TimeSpan.FromSeconds(5);
 });
 builder.Services.AddHttpClient<LocationService>(client =>
 {
@@ -97,6 +99,11 @@ builder.Services.AddHttpClient<LocationService>(client =>
     client.Timeout = TimeSpan.FromSeconds(15);
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
         "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
+});
+builder.Services.AddHttpClient("OpenMeteoGeocoding", client =>
+{
+    client.BaseAddress = new Uri("https://geocoding-api.open-meteo.com/");
+    client.Timeout = TimeSpan.FromSeconds(15);
 });
 builder.Services.Configure<PasswordHasherOptions>(options =>
 {
@@ -136,9 +143,10 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend",
         policy => policy
-            .WithOrigins("http://localhost:5173")
+            .WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
             .AllowAnyMethod()
             .AllowAnyHeader()
+            .AllowCredentials()
     );
 });
 
@@ -173,7 +181,10 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json?v=net10", "AnteraApp.Api v1");
 });
 
-app.UseHttpsRedirection();
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
 app.MapGet("/api/locations/search", async (
     string query,
@@ -200,7 +211,6 @@ app.MapGet("/api/locations/search", async (
             statusCode: StatusCodes.Status502BadGateway);
     }
 })
-.RequireAuthorization()
 .WithName("SearchSpanishLocations");
 
 app.MapGet("/api/pollen/current", async (
@@ -230,7 +240,6 @@ app.MapGet("/api/pollen/current", async (
             statusCode: StatusCodes.Status502BadGateway);
     }
 })
-.RequireAuthorization()
 .WithName("GetCurrentPollen");
 
 app.MapGet("/api/pollen/types", () => Results.Ok(PollenCatalog.Types))
@@ -296,17 +305,76 @@ app.MapPost("/api/auth/register", async (
 .WithName("RegisterUser");
 
 app.MapPost("/api/auth/login", async (
+    HttpResponse response,
     AuthService authService,
     LoginRequest request,
     CancellationToken cancellationToken) =>
 {
-    var token = await authService.LoginAsync(request, cancellationToken);
-    if (token == null)
+    var session = await authService.LoginAsync(request, cancellationToken);
+    if (session == null)
         return Results.Unauthorized();
 
-    return Results.Ok(new AuthResponse { Token = token });
+    if (session.RefreshToken is not null)
+    {
+        SetRefreshTokenCookie(
+            response,
+            session.RefreshToken,
+            jwtSettings.RefreshTokenExpirationDays,
+            !app.Environment.IsDevelopment());
+    }
+    else
+    {
+        DeleteRefreshTokenCookie(response);
+    }
+
+    return Results.Ok(new AuthResponse { Token = session.AccessToken });
 })
 .WithName("LoginUser");
+
+app.MapPost("/api/auth/refresh", async (
+    HttpRequest request,
+    HttpResponse response,
+    AuthService authService,
+    CancellationToken cancellationToken) =>
+{
+    if (!request.Cookies.TryGetValue("antera_refresh", out var refreshToken) ||
+        string.IsNullOrWhiteSpace(refreshToken))
+    {
+        return Results.Unauthorized();
+    }
+
+    var session = await authService.RefreshAsync(refreshToken, cancellationToken);
+    if (session is null || session.RefreshToken is null)
+    {
+        DeleteRefreshTokenCookie(response);
+        return Results.Unauthorized();
+    }
+
+    SetRefreshTokenCookie(
+        response,
+        session.RefreshToken,
+        jwtSettings.RefreshTokenExpirationDays,
+        !app.Environment.IsDevelopment());
+    return Results.Ok(new AuthResponse { Token = session.AccessToken });
+})
+.WithName("RefreshUserSession");
+
+app.MapPost("/api/auth/logout", async (
+    HttpRequest request,
+    HttpResponse response,
+    AuthService authService,
+    CancellationToken cancellationToken) =>
+{
+    if (request.Cookies.TryGetValue("antera_refresh", out var refreshToken) &&
+        !string.IsNullOrWhiteSpace(refreshToken))
+    {
+        await authService.RevokeRefreshTokenAsync(refreshToken, cancellationToken);
+    }
+
+    DeleteRefreshTokenCookie(response);
+    return Results.NoContent();
+})
+.WithName("LogoutUser");
 
 // Ruta protegida por JWT
 app.MapGet("/api/protected", [Authorize]() =>
@@ -316,6 +384,26 @@ app.MapGet("/api/protected", [Authorize]() =>
 .WithName("ProtectedRoute");
 
 app.Run();
+
+static void SetRefreshTokenCookie(
+    HttpResponse response,
+    string refreshToken,
+    int expirationDays,
+    bool secure)
+{
+    response.Cookies.Append("antera_refresh", refreshToken, new CookieOptions
+    {
+        HttpOnly = true,
+        IsEssential = true,
+        SameSite = SameSiteMode.Lax,
+        Secure = secure,
+        Expires = DateTimeOffset.UtcNow.AddDays(expirationDays),
+        Path = "/api/auth"
+    });
+}
+
+static void DeleteRefreshTokenCookie(HttpResponse response) =>
+    response.Cookies.Delete("antera_refresh", new CookieOptions { Path = "/api/auth" });
 
 record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 {

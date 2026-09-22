@@ -6,7 +6,10 @@ using System.Text.Json;
 
 namespace AnteraApp.Api.Services;
 
-public sealed class LocationService(HttpClient httpClient, IMemoryCache cache)
+public sealed class LocationService(
+    HttpClient httpClient,
+    IHttpClientFactory httpClientFactory,
+    IMemoryCache cache)
 {
     private static readonly SemaphoreSlim RequestGate = new(1, 1);
     private static DateTimeOffset _nextRequestAt = DateTimeOffset.MinValue;
@@ -69,27 +72,107 @@ public sealed class LocationService(HttpClient httpClient, IMemoryCache cache)
         var curatedSuggestions = BalearicIslandSuggestions
             .Where(suggestion => IsRelevantToQuery(suggestion.Name, NormalizeSearchTerm(normalizedQuery)))
             .ToArray();
-        if (curatedSuggestions.Length > 0)
+        // Las islas se mantienen como resultados especiales cuando se buscan por su nombre
+        // completo. Una coincidencia parcial ("Mal") no debe impedir que Nominatim aporte
+        // otras localidades, como Málaga.
+        if (curatedSuggestions.Any(suggestion =>
+                string.Equals(NormalizeSearchTerm(suggestion.Name), NormalizeSearchTerm(normalizedQuery), StringComparison.Ordinal)))
         {
             return curatedSuggestions;
         }
 
         // No se persisten respuestas vacías: el proveedor puede completar su índice más tarde
         // y una búsqueda temporalmente sin candidatos no debe ocultar ubicaciones durante horas.
-        var cacheKey = $"location-search:v5:{normalizedQuery.ToUpperInvariant()}";
+        var cacheKey = $"location-search:v8:{normalizedQuery.ToUpperInvariant()}";
         if (cache.TryGetValue<IReadOnlyList<LocationSuggestionDto>>(cacheKey, out var cachedSuggestions))
         {
             return cachedSuggestions;
         }
 
-        var suggestions = await ResolveSpanishSettlementsAsync(normalizedQuery, cancellationToken);
-        if (suggestions.Count > 0)
+        var autocompleteSuggestions = await ResolveOpenMeteoSpanishSettlementsAsync(
+            normalizedQuery, cancellationToken);
+        var nominatimSuggestions = autocompleteSuggestions.Count < 6
+            ? await ResolveSpanishSettlementsAsync(normalizedQuery, cancellationToken)
+            : [];
+        var suggestions = autocompleteSuggestions
+            .Concat(nominatimSuggestions)
+            .Concat(curatedSuggestions)
+            .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
+            .Select(group => group.First())
+            .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name)
+                .StartsWith(NormalizeSearchTerm(normalizedQuery), StringComparison.Ordinal))
+            .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
+            .Take(6)
+            .ToArray();
+        if (suggestions.Length > 0)
         {
             cache.Set(cacheKey, suggestions, TimeSpan.FromHours(12));
         }
 
         return suggestions;
     }
+
+    private async Task<IReadOnlyList<LocationSuggestionDto>> ResolveOpenMeteoSpanishSettlementsAsync(
+        string query,
+        CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient("OpenMeteoGeocoding");
+        var requestUri = $"v1/search?name={Uri.EscapeDataString(query)}&count=20&language=es&format=json&countryCode=ES";
+        using var response = await client.GetAsync(requestUri, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        if (!document.RootElement.TryGetProperty("results", out var results) ||
+            results.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        var normalizedQuery = NormalizeSearchTerm(query);
+        return results
+            .EnumerateArray()
+            .Where(result => string.Equals(GetFirstValue(result, "country_code"), "ES", StringComparison.OrdinalIgnoreCase))
+            .Where(IsSettlementResult)
+            .Select(ToOpenMeteoSuggestion)
+            .Where(suggestion => suggestion is not null)
+            .Select(suggestion => suggestion!)
+            .Where(suggestion => IsRelevantToQuery(suggestion.Name, normalizedQuery))
+            .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
+            .Select(group => group.First())
+            .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name)
+                .StartsWith(normalizedQuery, StringComparison.Ordinal))
+            .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
+            .Take(6)
+            .ToArray();
+    }
+
+    private static bool IsSettlementResult(JsonElement result)
+    {
+        var featureCode = GetFirstValue(result, "feature_code");
+        return featureCode is not null &&
+               (featureCode.StartsWith("PPL", StringComparison.OrdinalIgnoreCase) ||
+                featureCode is "ADM2" or "ADM3" or "ADM4");
+    }
+
+    private static LocationSuggestionDto? ToOpenMeteoSuggestion(JsonElement result)
+    {
+        var name = GetFirstValue(result, "name");
+        if (string.IsNullOrWhiteSpace(name) ||
+            !TryGetCoordinateProperty(result, "latitude", out var latitude) ||
+            !TryGetCoordinateProperty(result, "longitude", out var longitude))
+        {
+            return null;
+        }
+
+        var province = NormalizeProvince(GetFirstValue(result, "admin2", "admin1"));
+        return new LocationSuggestionDto(name, province, latitude, longitude);
+    }
+
+    private static string? NormalizeProvince(string? value) => value?
+        .Replace("Provincia de ", string.Empty, StringComparison.OrdinalIgnoreCase)
+        .Replace("Comunidad Autónoma de ", string.Empty, StringComparison.OrdinalIgnoreCase)
+        .Replace("Principado de ", string.Empty, StringComparison.OrdinalIgnoreCase);
 
     private async Task<LocationContext> ResolveLocationContextAsync(
         double latitude,
@@ -161,7 +244,7 @@ public sealed class LocationService(HttpClient httpClient, IMemoryCache cache)
             }
 
             _nextRequestAt = DateTimeOffset.UtcNow.AddSeconds(1);
-            var requestUri = $"search?format=jsonv2&addressdetails=1&countrycodes=es&limit=10&accept-language=es&q={Uri.EscapeDataString(searchQuery)}";
+            var requestUri = $"search?format=jsonv2&addressdetails=1&countrycodes=es&limit=50&accept-language=es&q={Uri.EscapeDataString(searchQuery)}";
             using var response = await httpClient.GetAsync(requestUri, cancellationToken);
             response.EnsureSuccessStatusCode();
 

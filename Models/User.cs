@@ -17,5 +17,8 @@ namespace AnteraApp.Api.Models
 
         [BsonElement("favoritePollenTypes")]
         public List<string> FavoritePollenTypes { get; set; } = [];
+
+        [BsonElement("refreshTokens")]
+        public List<RefreshTokenSession> RefreshTokens { get; set; } = [];
     }
 }

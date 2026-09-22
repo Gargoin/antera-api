@@ -1,4 +1,5 @@
 using AnteraApp.Api.Models;
+using Microsoft.Extensions.Caching.Memory;
 using System.Globalization;
 using System.Text.Json;
 
@@ -10,6 +11,7 @@ public sealed class PollenService(
     MadridPollenService madridPollenService,
     CastillaLeonPollenService castillaLeonPollenService,
     CataloniaPollenService cataloniaPollenService,
+    IMemoryCache cache,
     ILogger<PollenService> logger)
 {
     private static readonly (string ApiName, string DisplayName)[] PollenTypes =
@@ -27,12 +29,35 @@ public sealed class PollenService(
         double longitude,
         CancellationToken cancellationToken)
     {
+        var cacheKey = string.Create(CultureInfo.InvariantCulture,
+            $"pollen-reading:{Math.Round(latitude, 3)}:{Math.Round(longitude, 3)}");
+        var reading = await cache.GetOrCreateAsync(cacheKey, async entry =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);
+            return await GetCurrentUncachedAsync(latitude, longitude, cancellationToken);
+        });
+
+        return reading ?? throw new InvalidOperationException("No pollen reading could be generated.");
+    }
+
+    private async Task<PollenReadingDto> GetCurrentUncachedAsync(
+        double latitude,
+        double longitude,
+        CancellationToken cancellationToken)
+    {
+        var variables = string.Join(',', PollenTypes.Select(type => type.ApiName));
+        var requestUri = string.Create(CultureInfo.InvariantCulture,
+            $"v1/air-quality?latitude={latitude}&longitude={longitude}&current={variables}&timezone=auto");
+        // La geocodificación inversa y Open-Meteo no dependen una de otra. Arrancarlas a la vez
+        // evita sumar sus latencias en todas las ubicaciones que usan la estimación ambiental.
+        var openMeteoResponseTask = httpClient.GetAsync(requestUri, cancellationToken);
         var locationContext = await TryGetLocationContextAsync(latitude, longitude, cancellationToken);
         if (IsMadrid(locationContext.Region, latitude, longitude))
         {
             try
             {
                 var regionalReading = await madridPollenService.GetCurrentAsync(cancellationToken);
+                _ = DisposeUnusedResponseAsync(openMeteoResponseTask);
                 return new PollenReadingDto(
                     regionalReading.Date,
                     "Europe/Madrid",
@@ -45,7 +70,7 @@ public sealed class PollenService(
                     regionalReading.Station,
                     "Las mediciones proceden de la red regional y pueden publicarse con retraso respecto al momento de consulta.");
             }
-            catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidOperationException)
+            catch (Exception exception) when (IsRecoverableProviderFailure(exception, cancellationToken))
             {
                 logger.LogWarning(exception, "No se pudo obtener la lectura regional de PALINOCAM.");
             }
@@ -56,6 +81,7 @@ public sealed class PollenService(
             try
             {
                 var regionalReading = await castillaLeonPollenService.GetCurrentAsync(cancellationToken);
+                _ = DisposeUnusedResponseAsync(openMeteoResponseTask);
                 return new PollenReadingDto(
                     regionalReading.Date,
                     "Europe/Madrid",
@@ -68,7 +94,7 @@ public sealed class PollenService(
                     regionalReading.Station,
                     "La red regional publica niveles y previsiones semanalmente; consulta la fecha de actualización antes de tomar decisiones de salud.");
             }
-            catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidOperationException)
+            catch (Exception exception) when (IsRecoverableProviderFailure(exception, cancellationToken))
             {
                 // Si la fuente regional no responde, se mantiene la cobertura con el modelo ambiental.
             }
@@ -79,6 +105,7 @@ public sealed class PollenService(
             try
             {
                 var regionalReading = await cataloniaPollenService.GetCurrentAsync(latitude, longitude, cancellationToken);
+                _ = DisposeUnusedResponseAsync(openMeteoResponseTask);
                 return new PollenReadingDto(
                     regionalReading.Date,
                     "Europe/Madrid",
@@ -91,17 +118,13 @@ public sealed class PollenService(
                     regionalReading.Station,
                     "Niveles y previsiones semanales de la XAC. Fuente bajo licencia CC BY-NC-SA 4.0.");
             }
-            catch (Exception exception) when (exception is HttpRequestException or InvalidOperationException)
+            catch (Exception exception) when (IsRecoverableProviderFailure(exception, cancellationToken))
             {
                 logger.LogWarning(exception, "No se pudo obtener la lectura regional de la XAC.");
             }
         }
 
-        var variables = string.Join(',', PollenTypes.Select(type => type.ApiName));
-        var requestUri = string.Create(CultureInfo.InvariantCulture,
-            $"v1/air-quality?latitude={latitude}&longitude={longitude}&current={variables}&timezone=auto");
-
-        using var response = await httpClient.GetAsync(requestUri, cancellationToken);
+        using var response = await openMeteoResponseTask;
         response.EnsureSuccessStatusCode();
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -142,6 +165,22 @@ public sealed class PollenService(
             "Estimación ambiental",
             null,
             notice);
+    }
+
+    private static bool IsRecoverableProviderFailure(Exception exception, CancellationToken cancellationToken) =>
+        exception is HttpRequestException or JsonException or InvalidOperationException ||
+        exception is OperationCanceledException && !cancellationToken.IsCancellationRequested;
+
+    private static async Task DisposeUnusedResponseAsync(Task<HttpResponseMessage> responseTask)
+    {
+        try
+        {
+            using var response = await responseTask;
+        }
+        catch (Exception)
+        {
+            // La fuente regional ya ha respondido; un fallo de la alternativa no debe afectar a la lectura.
+        }
     }
 
     private async Task<LocationContext> TryGetLocationContextAsync(
