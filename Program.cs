@@ -100,6 +100,11 @@ builder.Services.AddHttpClient<LocationService>(client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
         "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
 });
+builder.Services.AddHttpClient<AirQualityService>(client =>
+{
+    client.BaseAddress = new Uri("https://air-quality-api.open-meteo.com/");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
 builder.Services.AddHttpClient("OpenMeteoGeocoding", client =>
 {
     client.BaseAddress = new Uri("https://geocoding-api.open-meteo.com/");
@@ -241,6 +246,34 @@ app.MapGet("/api/pollen/current", async (
     }
 })
 .WithName("GetCurrentPollen");
+
+app.MapGet("/api/air-quality/current", async (
+    double latitude,
+    double longitude,
+    AirQualityService airQualityService,
+    CancellationToken cancellationToken) =>
+{
+    if (latitude is < -90 or > 90 || longitude is < -180 or > 180)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["coordinates"] = ["Las coordenadas indicadas no son válidas."]
+        });
+    }
+
+    try
+    {
+        var reading = await airQualityService.GetCurrentAsync(latitude, longitude, cancellationToken);
+        return Results.Ok(reading);
+    }
+    catch (Exception exception) when (exception is HttpRequestException or JsonException or InvalidOperationException)
+    {
+        return Results.Problem(
+            title: "No se han podido obtener los datos de calidad del aire.",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+})
+.WithName("GetCurrentAirQuality");
 
 app.MapGet("/api/pollen/types", () => Results.Ok(PollenCatalog.Types))
     .RequireAuthorization()
