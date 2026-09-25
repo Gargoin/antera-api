@@ -76,12 +76,12 @@ public static class PollenAllergyLevelClassifier
 
     private static AllergyLevelScale GetScale(string normalizedName) => normalizedName switch
     {
-        var item when ContainsAny(item, "viborera", "echium", "mercurial", "mercurialis") => Group1,
+        var item when ContainsAny(item, "viborera", "echium", "mercurial", "mercurialis", "melcoratge", "malcoratge") => Group1,
         var item when ContainsAny(item, "acedera", "rumex", "artemisa", "artemisia") => Group2,
         var item when ContainsAny(item, "ambrosia", "ragweed", "margaritas", "asteraceas", "diente de leon", "taraxacum", "girasol", "helianthus", "brezo", "ericaceae", "rosaceas", "rosaceae") => Group2,
-        var item when ContainsAny(item, "amarantaceas", "amaranthaceae", "chenopodiaceae", "ortiga", "parietaria", "urticaceae") => Group2Low,
+        var item when ContainsAny(item, "cenigos", "cenizos", "cenizo", "blets", "amarantaceas", "amaranthaceae", "chenopodiaceae", "ortiga", "parietaria", "urticaceae") => Group2Low,
         var item when ContainsAny(item, "llanten", "plantago", "gramineas", "poaceae", "grass") => Group2Grass,
-        var item when ContainsAny(item, "castano", "castanea", "chopo", "alamo", "populus", "moral", "morus", "sauce", "salix", "tilo", "tilia", "eucalipto", "myrtaceae", "aligustre", "ligustrum", "aliso", "alnus", "abedul", "betula", "fresno", "fraxinus") => Group3,
+        var item when ContainsAny(item, "castano", "castanyer", "castanea", "chopo", "alamo", "populus", "moral", "morus", "sauce", "salix", "tilo", "tilia", "eucalipto", "myrtaceae", "aligustre", "ligustrum", "aliso", "alnus", "abedul", "betula", "fresno", "fraxinus", "haya", "faig", "fagus") => Group3,
         var item when ContainsAny(item, "cipres", "cupressaceae", "cupresaceas", "olivo", "olea", "pino", "pinus", "platano", "platanus", "encina", "roble", "quercus") => Group4,
         _ => Group2
     };

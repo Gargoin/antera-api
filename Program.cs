@@ -421,6 +421,33 @@ app.MapPut("/api/user/password", async (
 .RequireAuthorization()
 .WithName("UpdateUserPassword");
 
+app.MapDelete("/api/user/account", async (
+    HttpResponse response,
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    [Microsoft.AspNetCore.Mvc.FromBody] DeleteUserAccountRequest request,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    if (userId is null) return Results.Unauthorized();
+    if (string.IsNullOrWhiteSpace(request.CurrentPassword))
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["currentPassword"] = ["Introduce tu contraseña actual."]
+        });
+    }
+
+    var deleted = await authService.DeleteAccountAsync(userId, request.CurrentPassword, cancellationToken);
+    if (deleted is null) return Results.Unauthorized();
+    if (deleted is false) return Results.BadRequest(new { message = "La contraseña actual no es correcta." });
+
+    DeleteRefreshTokenCookie(response);
+    return Results.NoContent();
+})
+.RequireAuthorization()
+.WithName("DeleteUserAccount");
+
 app.MapPost("/api/auth/register", async (
     AuthService authService,
     RegisterRequest request,
@@ -428,19 +455,22 @@ app.MapPost("/api/auth/register", async (
 {
     request.Name = request.Name?.Trim() ?? string.Empty;
     request.Email = request.Email?.Trim().ToLowerInvariant() ?? string.Empty;
-    if (string.IsNullOrWhiteSpace(request.Name) || request.Name.Length > 80 ||
-        string.IsNullOrWhiteSpace(request.Email) || request.Email.Length > 254 || !request.Email.Contains('@') ||
-        string.IsNullOrWhiteSpace(request.Password) || request.Password.Length is < 8 or > 128)
+    var validationErrors = new Dictionary<string, string[]>();
+    if (string.IsNullOrWhiteSpace(request.Name) || request.Name.Length > 80)
+        validationErrors["name"] = ["Introduce un nombre de usuario de hasta 80 caracteres."];
+    if (string.IsNullOrWhiteSpace(request.Email) || request.Email.Length > 254 || !request.Email.Contains('@'))
+        validationErrors["email"] = ["Introduce un correo electrónico válido."];
+    if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length is < 8 or > 128)
+        validationErrors["password"] = ["La contraseña debe tener entre 8 y 128 caracteres."];
+
+    if (validationErrors.Count > 0)
     {
-        return Results.ValidationProblem(new Dictionary<string, string[]>
-        {
-            ["registration"] = ["Revisa el nombre, el correo y la contraseña introducidos."]
-        });
+        return Results.ValidationProblem(validationErrors);
     }
 
     var token = await authService.RegisterAsync(request, cancellationToken);
     if (token is null)
-        return Results.BadRequest("User already exists.");
+        return Results.Conflict(new { field = "email", message = "Ya existe una cuenta con este correo electrónico." });
 
     return Results.Created("/api/user/pollen-preferences", new AuthResponse { Token = token });
 })

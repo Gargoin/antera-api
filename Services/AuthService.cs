@@ -194,6 +194,19 @@ namespace AnteraApp.Api.Services
             return true;
         }
 
+        public async Task<bool?> DeleteAccountAsync(
+            string userId,
+            string currentPassword,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
+            if (user is null) return null;
+            if (VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return false;
+
+            var result = await _users.DeleteOneAsync(candidate => candidate.Id == userId, cancellationToken);
+            return result.DeletedCount == 1;
+        }
+
         private async Task<AuthSession> CreateSessionAsync(
             User user,
             bool rememberMe,
