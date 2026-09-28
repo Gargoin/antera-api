@@ -4,5 +4,6 @@ namespace AnteraApp.Api.Models
     {
         public string AccessToken { get; set; } = null!;
         public string? RefreshToken { get; set; }
+        public bool EmailConfirmationRequired { get; set; }
     }
 }

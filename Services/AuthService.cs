@@ -44,13 +44,14 @@ namespace AnteraApp.Api.Services
             var user = new User
             {
                 Email = request.Email,
-                Name = request.Name
+                Name = request.Name,
+                EmailConfirmationTokenHash = "pending"
             };
 
             user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
 
             await _users.InsertOneAsync(user, cancellationToken: cancellationToken);
-            return _jwtService.GenerateToken(user);
+            return _jwtService.GenerateToken(user, registrationOnboarding: true);
         }
 
         public async Task<AuthSession?> LoginAsync(
@@ -66,6 +67,11 @@ namespace AnteraApp.Api.Services
             var verificationResult = VerifyPassword(user, request.Password);
             if (verificationResult == PasswordVerificationResult.Failed) return null;
 
+            if (RequiresEmailConfirmation(user))
+            {
+                return new AuthSession { EmailConfirmationRequired = true };
+            }
+
             if (verificationResult == PasswordVerificationResult.SuccessRehashNeeded)
             {
                 user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
@@ -77,6 +83,83 @@ namespace AnteraApp.Api.Services
             }
 
             return await CreateSessionAsync(user, request.RememberMe, cancellationToken);
+        }
+
+        public async Task<EmailConfirmation?> CreateEmailConfirmationAsync(
+            string userId,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
+            return await CreateEmailConfirmationAsync(user, cancellationToken);
+        }
+
+        public async Task<EmailConfirmation?> CreateEmailConfirmationForEmailAsync(
+            string email,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Email == email).FirstOrDefaultAsync(cancellationToken);
+            return await CreateEmailConfirmationAsync(user, cancellationToken);
+        }
+
+        public async Task<bool> ConfirmEmailAsync(string token, CancellationToken cancellationToken)
+        {
+            var now = DateTime.UtcNow;
+            var tokenHash = HashToken(token);
+            var result = await _users.UpdateOneAsync(
+                candidate => candidate.EmailConfirmedAt == null &&
+                    candidate.EmailConfirmationTokenHash == tokenHash &&
+                    candidate.EmailConfirmationTokenExpiresAt > now,
+                Builders<User>.Update
+                    .Set(candidate => candidate.EmailConfirmedAt, now)
+                    .Unset(candidate => candidate.EmailConfirmationTokenHash)
+                    .Unset(candidate => candidate.EmailConfirmationTokenExpiresAt),
+                cancellationToken: cancellationToken);
+            return result.ModifiedCount == 1;
+        }
+
+        public async Task<PasswordReset?> CreatePasswordResetForEmailAsync(
+            string email,
+            CancellationToken cancellationToken)
+        {
+            var user = await _users.Find(candidate => candidate.Email == email).FirstOrDefaultAsync(cancellationToken);
+            if (user is null || RequiresEmailConfirmation(user) || user.Id is null)
+            {
+                return null;
+            }
+
+            var now = DateTime.UtcNow;
+            if (user.PasswordResetLastSentAt > now.AddMinutes(-1))
+            {
+                return null;
+            }
+
+            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
+            await _users.UpdateOneAsync(
+                candidate => candidate.Id == user.Id,
+                Builders<User>.Update
+                    .Set(candidate => candidate.PasswordResetTokenHash, HashToken(token))
+                    .Set(candidate => candidate.PasswordResetTokenExpiresAt, now.AddHours(1))
+                    .Set(candidate => candidate.PasswordResetLastSentAt, now),
+                cancellationToken: cancellationToken);
+
+            return new PasswordReset(user.Email, user.Name, token);
+        }
+
+        public async Task<bool> ResetPasswordAsync(string token, string newPassword, CancellationToken cancellationToken)
+        {
+            var now = DateTime.UtcNow;
+            var passwordHash = _passwordHasher.HashPassword(new User(), newPassword);
+            var result = await _users.UpdateOneAsync(
+                candidate => candidate.PasswordResetTokenHash == HashToken(token) &&
+                    candidate.PasswordResetTokenExpiresAt > now,
+                Builders<User>.Update
+                    .Set(candidate => candidate.PasswordHash, passwordHash)
+                    .Set(candidate => candidate.RefreshTokens, new List<RefreshTokenSession>())
+                    .Unset(candidate => candidate.PasswordResetTokenHash)
+                    .Unset(candidate => candidate.PasswordResetTokenExpiresAt),
+                cancellationToken: cancellationToken);
+
+            return result.ModifiedCount == 1;
         }
 
         public async Task<AuthSession?> RefreshAsync(
@@ -194,17 +277,16 @@ namespace AnteraApp.Api.Services
             return true;
         }
 
-        public async Task<bool?> DeleteAccountAsync(
+        public async Task<DeletedAccount?> DeleteAccountAsync(
             string userId,
             string currentPassword,
             CancellationToken cancellationToken)
         {
             var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
-            if (user is null) return null;
-            if (VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return false;
+            if (user is null || VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return null;
 
             var result = await _users.DeleteOneAsync(candidate => candidate.Id == userId, cancellationToken);
-            return result.DeletedCount == 1;
+            return result.DeletedCount == 1 ? new DeletedAccount(user.Email, user.Name) : null;
         }
 
         private async Task<AuthSession> CreateSessionAsync(
@@ -245,6 +327,34 @@ namespace AnteraApp.Api.Services
 
         private int GetRefreshTokenExpirationDays() =>
             _jwtSettings.RefreshTokenExpirationDays;
+
+        private async Task<EmailConfirmation?> CreateEmailConfirmationAsync(User? user, CancellationToken cancellationToken)
+        {
+            if (user is null || !RequiresEmailConfirmation(user) || user.Id is null)
+            {
+                return null;
+            }
+
+            var now = DateTime.UtcNow;
+            if (user.EmailConfirmationLastSentAt > now.AddMinutes(-1))
+            {
+                return null;
+            }
+
+            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
+            await _users.UpdateOneAsync(
+                candidate => candidate.Id == user.Id,
+                Builders<User>.Update
+                    .Set(candidate => candidate.EmailConfirmationTokenHash, HashToken(token))
+                    .Set(candidate => candidate.EmailConfirmationTokenExpiresAt, now.AddHours(24))
+                    .Set(candidate => candidate.EmailConfirmationLastSentAt, now),
+                cancellationToken: cancellationToken);
+
+            return new EmailConfirmation(user.Email, user.Name, token);
+        }
+
+        private static bool RequiresEmailConfirmation(User user) =>
+            user.EmailConfirmedAt is null && !string.IsNullOrWhiteSpace(user.EmailConfirmationTokenHash);
 
         private static string CreateRefreshToken() =>
             Convert.ToBase64String(RandomNumberGenerator.GetBytes(64));

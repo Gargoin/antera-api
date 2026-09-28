@@ -17,14 +17,20 @@ namespace AnteraApp.Api.Services
             _jwtSettings = jwtSettings.Value;
         }
 
-        public string GenerateToken(User user)
+        public string GenerateToken(User user, bool registrationOnboarding = false)
         {
-            var claims = new[]
+            var claims = new List<Claim>
             {
                 new Claim(JwtRegisteredClaimNames.Sub, user.Id!),
                 new Claim(JwtRegisteredClaimNames.Email, user.Email!),
-                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new Claim("email_confirmed", (!RequiresEmailConfirmation(user)).ToString().ToLowerInvariant())
             };
+
+            if (registrationOnboarding)
+            {
+                claims.Add(new Claim("scope", "registration_onboarding"));
+            }
 
             var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.Secret!));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
@@ -39,5 +45,8 @@ namespace AnteraApp.Api.Services
 
             return new JwtSecurityTokenHandler().WriteToken(token);
         }
+
+        private static bool RequiresEmailConfirmation(User user) =>
+            user.EmailConfirmedAt is null && !string.IsNullOrWhiteSpace(user.EmailConfirmationTokenHash);
     }
 }

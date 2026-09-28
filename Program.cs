@@ -55,6 +55,8 @@ builder.Services.AddOptions<JwtSettings>()
         "Jwt:RefreshTokenExpirationDays must be between 1 and 90.")
     .ValidateOnStart();
 
+builder.Services.Configure<ResendSettings>(builder.Configuration.GetSection(ResendSettings.SectionName));
+
 var jwtSettings = builder.Configuration
     .GetRequiredSection(JwtSettings.SectionName)
     .Get<JwtSettings>()
@@ -69,6 +71,7 @@ if (Encoding.UTF8.GetByteCount(jwtSettings.Secret) < 32)
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JwtService>();
 builder.Services.AddSingleton<PollenPreferencesService>();
+builder.Services.AddHttpClient<ResendEmailService>(client => client.BaseAddress = new Uri("https://api.resend.com/"));
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient<PollenService>(client =>
 {
@@ -141,7 +144,13 @@ builder.Services.AddAuthentication(options =>
     };
 });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("ConfirmedUser", policy => policy.RequireClaim("email_confirmed", "true"));
+    options.AddPolicy("ConfirmedUserOrRegistrationOnboarding", policy => policy.RequireAssertion(context =>
+        context.User.HasClaim("email_confirmed", "true") ||
+        context.User.HasClaim("scope", "registration_onboarding")));
+});
 
 // CORS
 builder.Services.AddCors(options =>
@@ -276,7 +285,7 @@ app.MapGet("/api/air-quality/current", async (
 .WithName("GetCurrentAirQuality");
 
 app.MapGet("/api/pollen/types", () => Results.Ok(PollenCatalog.Types))
-    .RequireAuthorization()
+    .RequireAuthorization("ConfirmedUserOrRegistrationOnboarding")
     .WithName("GetPollenTypes");
 
 app.MapGet("/api/user/pollen-preferences", async (
@@ -291,7 +300,7 @@ app.MapGet("/api/user/pollen-preferences", async (
     var preferences = await preferencesService.GetAsync(userId, cancellationToken);
     return preferences is null ? Results.Unauthorized() : Results.Ok(preferences);
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUserOrRegistrationOnboarding")
 .WithName("GetPollenPreferences");
 
 app.MapPut("/api/user/pollen-preferences", async (
@@ -321,7 +330,7 @@ app.MapPut("/api/user/pollen-preferences", async (
     var preferences = await preferencesService.UpdateAsync(userId, pollenTypeIds, cancellationToken);
     return preferences is null ? Results.Unauthorized() : Results.Ok(preferences);
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUserOrRegistrationOnboarding")
 .WithName("UpdatePollenPreferences");
 
 app.MapGet("/api/user/profile", async (
@@ -335,7 +344,7 @@ app.MapGet("/api/user/profile", async (
     var profile = await authService.GetProfileAsync(userId, cancellationToken);
     return profile is null ? Results.Unauthorized() : Results.Ok(profile);
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUser")
 .WithName("GetUserProfile");
 
 app.MapPut("/api/user/profile", async (
@@ -358,7 +367,7 @@ app.MapPut("/api/user/profile", async (
     var profile = await authService.UpdateNameAsync(userId, name, cancellationToken);
     return profile is null ? Results.Unauthorized() : Results.Ok(profile);
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUser")
 .WithName("UpdateUserProfile");
 
 app.MapPut("/api/user/email", async (
@@ -385,7 +394,7 @@ app.MapPut("/api/user/email", async (
         ? Results.BadRequest(new { message = "No se ha podido validar el cambio de correo electrónico." })
         : Results.Ok(profile);
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUser")
 .WithName("UpdateUserEmail");
 
 app.MapPut("/api/user/password", async (
@@ -418,13 +427,14 @@ app.MapPut("/api/user/password", async (
         true => Results.NoContent()
     };
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUser")
 .WithName("UpdateUserPassword");
 
 app.MapDelete("/api/user/account", async (
     HttpResponse response,
     System.Security.Claims.ClaimsPrincipal user,
     AuthService authService,
+    ResendEmailService resendEmailService,
     [Microsoft.AspNetCore.Mvc.FromBody] DeleteUserAccountRequest request,
     CancellationToken cancellationToken) =>
 {
@@ -438,14 +448,24 @@ app.MapDelete("/api/user/account", async (
         });
     }
 
-    var deleted = await authService.DeleteAccountAsync(userId, request.CurrentPassword, cancellationToken);
-    if (deleted is null) return Results.Unauthorized();
-    if (deleted is false) return Results.BadRequest(new { message = "La contraseña actual no es correcta." });
+    var deletedAccount = await authService.DeleteAccountAsync(userId, request.CurrentPassword, cancellationToken);
+    if (deletedAccount is null) return Results.BadRequest(new { message = "La contraseña actual no es correcta." });
 
     DeleteRefreshTokenCookie(response);
+    try
+    {
+        await resendEmailService.SendAccountDeletionAsync(
+            deletedAccount.Recipient,
+            deletedAccount.Name,
+            cancellationToken);
+    }
+    catch (InvalidOperationException)
+    {
+        // La baja no debe depender de un proveedor de correo externo.
+    }
     return Results.NoContent();
 })
-.RequireAuthorization()
+.RequireAuthorization("ConfirmedUser")
 .WithName("DeleteUserAccount");
 
 app.MapPost("/api/auth/register", async (
@@ -485,6 +505,8 @@ app.MapPost("/api/auth/login", async (
     var session = await authService.LoginAsync(request, cancellationToken);
     if (session == null)
         return Results.Unauthorized();
+    if (session.EmailConfirmationRequired)
+        return Results.StatusCode(StatusCodes.Status403Forbidden);
 
     if (session.RefreshToken is not null)
     {
@@ -502,6 +524,133 @@ app.MapPost("/api/auth/login", async (
     return Results.Ok(new AuthResponse { Token = session.AccessToken });
 })
 .WithName("LoginUser");
+
+app.MapPost("/api/auth/send-email-confirmation", async (
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    ResendEmailService resendEmailService,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    if (userId is null) return Results.Unauthorized();
+
+    var confirmation = await authService.CreateEmailConfirmationAsync(userId, cancellationToken);
+    if (confirmation is null) return Results.Accepted();
+
+    try
+    {
+        await resendEmailService.SendConfirmationAsync(
+            confirmation.Recipient,
+            confirmation.Name,
+            confirmation.Token,
+            cancellationToken);
+        return Results.Accepted();
+    }
+    catch (InvalidOperationException)
+    {
+        return Results.Problem(title: "No se ha podido enviar el correo de confirmación.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.RequireAuthorization("ConfirmedUserOrRegistrationOnboarding")
+.WithName("SendEmailConfirmation");
+
+app.MapPost("/api/auth/resend-email-confirmation", async (
+    ResendConfirmationRequest request,
+    AuthService authService,
+    ResendEmailService resendEmailService,
+    CancellationToken cancellationToken) =>
+{
+    var email = request.Email?.Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(email) || email.Length > 254) return Results.Accepted();
+
+    var confirmation = await authService.CreateEmailConfirmationForEmailAsync(email, cancellationToken);
+    if (confirmation is null) return Results.Accepted();
+
+    try
+    {
+        await resendEmailService.SendConfirmationAsync(
+            confirmation.Recipient,
+            confirmation.Name,
+            confirmation.Token,
+            cancellationToken);
+    }
+    catch (InvalidOperationException)
+    {
+        return Results.Problem(title: "No se ha podido enviar el correo de confirmación.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    return Results.Accepted();
+})
+.WithName("ResendEmailConfirmation");
+
+app.MapPost("/api/auth/confirm-email", async (
+    ConfirmEmailRequest request,
+    AuthService authService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Token)) return Results.BadRequest(new { message = "El enlace de confirmación no es válido." });
+    var confirmed = await authService.ConfirmEmailAsync(request.Token, cancellationToken);
+    return confirmed
+        ? Results.NoContent()
+        : Results.BadRequest(new { message = "El enlace de confirmación no es válido o ha caducado." });
+})
+.WithName("ConfirmEmail");
+
+app.MapPost("/api/auth/forgot-password", async (
+    ForgotPasswordRequest request,
+    AuthService authService,
+    ResendEmailService resendEmailService,
+    CancellationToken cancellationToken) =>
+{
+    var email = request.Email?.Trim().ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(email) || email.Length > 254 || !email.Contains('@'))
+    {
+        return Results.Accepted();
+    }
+
+    var passwordReset = await authService.CreatePasswordResetForEmailAsync(email, cancellationToken);
+    if (passwordReset is null) return Results.Accepted();
+
+    try
+    {
+        await resendEmailService.SendPasswordResetAsync(
+            passwordReset.Recipient,
+            passwordReset.Name,
+            passwordReset.Token,
+            cancellationToken);
+    }
+    catch (InvalidOperationException)
+    {
+        // La respuesta no debe revelar la existencia de una cuenta ni el estado del proveedor de correo.
+    }
+
+    return Results.Accepted();
+})
+.WithName("ForgotPassword");
+
+app.MapPost("/api/auth/reset-password", async (
+    HttpResponse response,
+    ResetPasswordRequest request,
+    AuthService authService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Token) ||
+        string.IsNullOrWhiteSpace(request.NewPassword) ||
+        request.NewPassword.Length is < 8 or > 128)
+    {
+        return Results.BadRequest(new { message = "El enlace o la nueva contraseña no son válidos." });
+    }
+
+    var changed = await authService.ResetPasswordAsync(request.Token, request.NewPassword, cancellationToken);
+    if (!changed)
+    {
+        return Results.BadRequest(new { message = "El enlace no es válido o ha caducado." });
+    }
+
+    DeleteRefreshTokenCookie(response);
+    return Results.NoContent();
+})
+.WithName("ResetPassword");
 
 app.MapPost("/api/auth/refresh", async (
     HttpRequest request,
@@ -549,7 +698,7 @@ app.MapPost("/api/auth/logout", async (
 .WithName("LogoutUser");
 
 // Ruta protegida por JWT
-app.MapGet("/api/protected", [Authorize]() =>
+app.MapGet("/api/protected", [Authorize(Policy = "ConfirmedUser")]() =>
 {
     return Results.Ok("Access granted to protected route.");
 })
@@ -585,3 +734,6 @@ record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
 {
     public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
 }
+
+sealed record ResendConfirmationRequest(string? Email);
+sealed record ConfirmEmailRequest(string? Token);

@@ -9,3 +9,7 @@ public sealed record UpdateUserEmailRequest(string? Email, string? CurrentPasswo
 public sealed record UpdateUserPasswordRequest(string? CurrentPassword, string? NewPassword);
 
 public sealed record DeleteUserAccountRequest(string? CurrentPassword);
+
+public sealed record ForgotPasswordRequest(string? Email);
+
+public sealed record ResetPasswordRequest(string? Token, string? NewPassword);
