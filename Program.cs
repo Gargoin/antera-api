@@ -11,6 +11,12 @@ using Microsoft.AspNetCore.Authorization;
 
 var builder = WebApplication.CreateBuilder(args);
 
+var railwayPort = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrWhiteSpace(railwayPort))
+{
+    builder.WebHost.UseUrls($"http://0.0.0.0:{railwayPort}");
+}
+
 // Add services to the container
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
@@ -204,6 +210,8 @@ app.UseSwaggerUI(options =>
     options.RoutePrefix = "api-docs";
     options.SwaggerEndpoint("/swagger/v1/swagger.json?v=net10", "AnteraApp.Api v1");
 });
+
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 if (!app.Environment.IsDevelopment())
 {
