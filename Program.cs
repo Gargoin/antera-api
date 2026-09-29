@@ -152,12 +152,22 @@ builder.Services.AddAuthorization(options =>
         context.User.HasClaim("scope", "registration_onboarding")));
 });
 
+var allowedFrontendOrigins = (builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [])
+    .Where(origin => !string.IsNullOrWhiteSpace(origin))
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToList();
+
+if (builder.Environment.IsDevelopment())
+{
+    allowedFrontendOrigins.AddRange(["http://localhost:5173", "http://127.0.0.1:5173"]);
+}
+
 // CORS
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend",
         policy => policy
-            .WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
+            .WithOrigins([.. allowedFrontendOrigins.Distinct(StringComparer.OrdinalIgnoreCase)])
             .AllowAnyMethod()
             .AllowAnyHeader()
             .AllowCredentials()
