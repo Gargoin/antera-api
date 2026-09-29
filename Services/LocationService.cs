@@ -1,5 +1,7 @@
-using Microsoft.Extensions.Caching.Memory;
 using AnteraApp.Api.Models;
+using AnteraApp.Api.Settings;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -7,26 +9,16 @@ using System.Text.Json;
 namespace AnteraApp.Api.Services;
 
 public sealed class LocationService(
-    HttpClient httpClient,
+    HttpClient geoapifyClient,
     IHttpClientFactory httpClientFactory,
-    IMemoryCache cache)
+    IMemoryCache cache,
+    IOptions<GeoapifySettings> geoapifySettings)
 {
-    private static readonly SemaphoreSlim RequestGate = new(1, 1);
-    private static DateTimeOffset _nextRequestAt = DateTimeOffset.MinValue;
-    private static readonly IReadOnlyDictionary<string, string> SearchAliases =
-        new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["mallorca"] = "Mallorca, Illes Balears, España",
-            ["baleares"] = "Illes Balears, España",
-            ["islas baleares"] = "Illes Balears, España",
-            ["illes balears"] = "Illes Balears, España"
-        };
+    private readonly GeoapifySettings _geoapifySettings = geoapifySettings.Value;
+
     private static readonly HashSet<string> SearchStopWords =
         ["de", "del", "la", "las", "el", "los", "y"];
-    private static readonly HashSet<string> SettlementPlaceTypes =
-        ["city", "town", "village", "hamlet"];
-    private static readonly HashSet<string> SettlementAdministrativeTypes =
-        ["city", "town", "village", "hamlet", "municipality", "city_district"];
+
     // Las islas no siempre se catalogan como municipio por los geocodificadores.
     // Sus coordenadas son puntos de referencia para obtener la lectura ambiental de la isla.
     private static readonly IReadOnlyList<LocationSuggestionDto> BalearicIslandSuggestions =
@@ -54,14 +46,19 @@ public sealed class LocationService(
     {
         var cacheKey = string.Create(CultureInfo.InvariantCulture,
             $"location-context:{Math.Round(latitude, 3)}:{Math.Round(longitude, 3)}");
-
-        var context = await cache.GetOrCreateAsync(cacheKey, async entry =>
+        if (cache.TryGetValue<LocationContext>(cacheKey, out var cachedContext) && cachedContext is not null)
         {
-            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(12);
-            return await ResolveLocationContextAsync(latitude, longitude, cancellationToken);
-        });
+            return cachedContext;
+        }
 
-        return context ?? LocationContext.Approximate;
+        var context = await ResolveLocationContextAsync(latitude, longitude, cancellationToken);
+        // Una respuesta sin localidad puede ser transitoria. No la retenemos durante horas.
+        if (!string.Equals(context.DisplayName, LocationContext.Approximate.DisplayName, StringComparison.Ordinal))
+        {
+            cache.Set(cacheKey, context, TimeSpan.FromHours(12));
+        }
+
+        return context;
     }
 
     public async Task<IReadOnlyList<LocationSuggestionDto>> SearchSpanishSettlementsAsync(
@@ -69,39 +66,30 @@ public sealed class LocationService(
         CancellationToken cancellationToken)
     {
         var normalizedQuery = query.Trim();
+        var normalizedSearchTerm = NormalizeSearchTerm(normalizedQuery);
         var curatedSuggestions = BalearicIslandSuggestions
-            .Where(suggestion => IsRelevantToQuery(suggestion.Name, NormalizeSearchTerm(normalizedQuery)))
+            .Where(suggestion => IsRelevantToQuery(suggestion.Name, normalizedSearchTerm))
             .ToArray();
-        // Las islas se mantienen como resultados especiales cuando se buscan por su nombre
-        // completo. Una coincidencia parcial ("Mal") no debe impedir que Nominatim aporte
-        // otras localidades, como Málaga.
+
         if (curatedSuggestions.Any(suggestion =>
-                string.Equals(NormalizeSearchTerm(suggestion.Name), NormalizeSearchTerm(normalizedQuery), StringComparison.Ordinal)))
+                string.Equals(NormalizeSearchTerm(suggestion.Name), normalizedSearchTerm, StringComparison.Ordinal)))
         {
             return curatedSuggestions;
         }
 
-        // No se persisten respuestas vacías: el proveedor puede completar su índice más tarde
-        // y una búsqueda temporalmente sin candidatos no debe ocultar ubicaciones durante horas.
-        var cacheKey = $"location-search:v8:{normalizedQuery.ToUpperInvariant()}";
-        if (cache.TryGetValue<IReadOnlyList<LocationSuggestionDto>>(cacheKey, out var cachedSuggestions))
+        var cacheKey = $"location-search:v9:{normalizedQuery.ToUpperInvariant()}";
+        if (cache.TryGetValue<IReadOnlyList<LocationSuggestionDto>>(cacheKey, out var cachedSuggestions) &&
+            cachedSuggestions is not null)
         {
             return cachedSuggestions;
         }
 
-        var autocompleteSuggestions = await ResolveOpenMeteoSpanishSettlementsAsync(
-            normalizedQuery, cancellationToken);
-        var nominatimSuggestions = autocompleteSuggestions.Count < 6
-            ? await ResolveSpanishSettlementsAsync(normalizedQuery, cancellationToken)
-            : [];
-        var suggestions = autocompleteSuggestions
-            .Concat(nominatimSuggestions)
+        // Open-Meteo resuelve por prefijo y no depende de Nominatim, cuya cuota pública no
+        // permite completar búsquedas interactivas. Las sugerencias especiales se conservan.
+        var suggestions = (await ResolveOpenMeteoSpanishSettlementsAsync(normalizedQuery, cancellationToken))
             .Concat(curatedSuggestions)
             .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
             .Select(group => group.First())
-            .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name)
-                .StartsWith(NormalizeSearchTerm(normalizedQuery), StringComparison.Ordinal))
-            .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
             .Take(6)
             .ToArray();
         if (suggestions.Length > 0)
@@ -135,15 +123,19 @@ public sealed class LocationService(
             .Where(result => string.Equals(GetFirstValue(result, "country_code"), "ES", StringComparison.OrdinalIgnoreCase))
             .Where(IsSettlementResult)
             .Select(ToOpenMeteoSuggestion)
-            .Where(suggestion => suggestion is not null)
-            .Select(suggestion => suggestion!)
-            .Where(suggestion => IsRelevantToQuery(suggestion.Name, normalizedQuery))
-            .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
-            .Select(group => group.First())
-            .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name)
+            .Where(candidate => candidate is not null)
+            .Select(candidate => candidate!)
+            .Where(candidate => IsRelevantToQuery(candidate.Location.Name, normalizedQuery))
+            .GroupBy(candidate => NormalizeSearchTerm(candidate.Location.Name))
+            .Select(group => group.OrderByDescending(candidate => candidate.Population).First())
+            .OrderByDescending(candidate => string.Equals(
+                NormalizeSearchTerm(candidate.Location.Name), normalizedQuery, StringComparison.Ordinal))
+            .ThenByDescending(candidate => NormalizeSearchTerm(candidate.Location.Name)
                 .StartsWith(normalizedQuery, StringComparison.Ordinal))
-            .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ThenByDescending(candidate => candidate.Population)
+            .ThenBy(candidate => candidate.Location.Name, StringComparer.CurrentCultureIgnoreCase)
             .Take(6)
+            .Select(candidate => candidate.Location)
             .ToArray();
     }
 
@@ -155,7 +147,7 @@ public sealed class LocationService(
                 featureCode is "ADM2" or "ADM3" or "ADM4");
     }
 
-    private static LocationSuggestionDto? ToOpenMeteoSuggestion(JsonElement result)
+    private static OpenMeteoSuggestion? ToOpenMeteoSuggestion(JsonElement result)
     {
         var name = GetFirstValue(result, "name");
         if (string.IsNullOrWhiteSpace(name) ||
@@ -166,156 +158,64 @@ public sealed class LocationService(
         }
 
         var province = NormalizeProvince(GetFirstValue(result, "admin2", "admin1"));
-        return new LocationSuggestionDto(name, province, latitude, longitude);
+        return new OpenMeteoSuggestion(
+            new LocationSuggestionDto(name, province, latitude, longitude),
+            GetPopulation(result));
     }
-
-    private static string? NormalizeProvince(string? value) => value?
-        .Replace("Provincia de ", string.Empty, StringComparison.OrdinalIgnoreCase)
-        .Replace("Comunidad Autónoma de ", string.Empty, StringComparison.OrdinalIgnoreCase)
-        .Replace("Principado de ", string.Empty, StringComparison.OrdinalIgnoreCase);
 
     private async Task<LocationContext> ResolveLocationContextAsync(
         double latitude,
         double longitude,
         CancellationToken cancellationToken)
     {
-        await RequestGate.WaitAsync(cancellationToken);
-        try
+        if (string.IsNullOrWhiteSpace(_geoapifySettings.ApiKey))
         {
-            var delay = _nextRequestAt - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay, cancellationToken);
-            }
-
-            _nextRequestAt = DateTimeOffset.UtcNow.AddSeconds(1);
-
-            var requestUri = string.Create(CultureInfo.InvariantCulture,
-                $"reverse?format=jsonv2&addressdetails=1&layer=address&zoom=13&accept-language=es&lat={latitude}&lon={longitude}");
-            using var response = await httpClient.GetAsync(requestUri, cancellationToken);
-            response.EnsureSuccessStatusCode();
-
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-
-            if (!document.RootElement.TryGetProperty("address", out var address))
-            {
-                return LocationContext.Approximate;
-            }
-
-            var settlement = GetFirstValue(address, "village", "town", "city", "municipality", "hamlet", "suburb", "county");
-            var region = GetFirstValue(address, "state", "province", "region", "county");
-
-            if (string.IsNullOrWhiteSpace(settlement))
-            {
-                return new LocationContext("Ubicación aproximada", region);
-            }
-
-            var displayName = string.IsNullOrWhiteSpace(region) ||
-                              string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
-                ? settlement
-                : $"{settlement}, {region}";
-            return new LocationContext(displayName, region);
-        }
-        finally
-        {
-            RequestGate.Release();
-        }
-    }
-
-    private async Task<IReadOnlyList<LocationSuggestionDto>> ResolveSpanishSettlementsAsync(
-        string query,
-        CancellationToken cancellationToken)
-    {
-        var normalizedQuery = NormalizeSearchTerm(query);
-        var searchQuery = SearchAliases.TryGetValue(normalizedQuery, out var aliasedQuery)
-            ? aliasedQuery
-            : query;
-        // Se busca con el alias oficial, pero se filtra con lo que escribió la persona.
-        // Así "Mallorca" no exige que el resultado incluya también "Illes Balears, España".
-        var comparisonQuery = normalizedQuery;
-        await RequestGate.WaitAsync(cancellationToken);
-        try
-        {
-            var delay = _nextRequestAt - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay, cancellationToken);
-            }
-
-            _nextRequestAt = DateTimeOffset.UtcNow.AddSeconds(1);
-            var requestUri = $"search?format=jsonv2&addressdetails=1&countrycodes=es&limit=50&accept-language=es&q={Uri.EscapeDataString(searchQuery)}";
-            using var response = await httpClient.GetAsync(requestUri, cancellationToken);
-            response.EnsureSuccessStatusCode();
-
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-            if (document.RootElement.ValueKind != JsonValueKind.Array)
-            {
-                return [];
-            }
-
-            return document.RootElement
-                .EnumerateArray()
-                .Select(ToSettlementSuggestion)
-                .Where(suggestion => suggestion is not null)
-                .Select(suggestion => suggestion!)
-                .Where(suggestion => IsRelevantToQuery(suggestion.SearchText, comparisonQuery))
-                .GroupBy(suggestion => NormalizeSearchTerm(suggestion.Name))
-                .Select(group => group.First())
-                .OrderByDescending(suggestion => NormalizeSearchTerm(suggestion.Name).StartsWith(comparisonQuery, StringComparison.Ordinal))
-                .ThenBy(suggestion => suggestion.Name, StringComparer.CurrentCultureIgnoreCase)
-                .Take(6)
-                .Select(suggestion => new LocationSuggestionDto(
-                    suggestion.Name, suggestion.Province, suggestion.Latitude, suggestion.Longitude))
-                .ToArray();
-        }
-        finally
-        {
-            RequestGate.Release();
-        }
-    }
-
-    private static SettlementSuggestion? ToSettlementSuggestion(JsonElement result)
-    {
-        var category = GetFirstValue(result, "category");
-        var type = GetFirstValue(result, "type");
-        var addressType = GetFirstValue(result, "addresstype");
-        var isPlace = string.Equals(category, "place", StringComparison.OrdinalIgnoreCase) &&
-                      type is not null && SettlementPlaceTypes.Contains(type);
-        var isAdministrativeSettlement =
-            string.Equals(category, "boundary", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(type, "administrative", StringComparison.OrdinalIgnoreCase) &&
-            addressType is not null && SettlementAdministrativeTypes.Contains(addressType);
-        if (!isPlace && !isAdministrativeSettlement)
-        {
-            return null;
+            return LocationContext.Approximate;
         }
 
-        var settlement = GetFirstValue(result, "name");
+        var requestUri = string.Create(CultureInfo.InvariantCulture,
+            $"v1/geocode/reverse?lat={latitude}&lon={longitude}&format=json&lang=es&apiKey={Uri.EscapeDataString(_geoapifySettings.ApiKey)}");
+        using var response = await geoapifyClient.GetAsync(requestUri, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        if (!document.RootElement.TryGetProperty("results", out var results) ||
+            results.ValueKind != JsonValueKind.Array)
+        {
+            return LocationContext.Approximate;
+        }
+
+        var location = results.EnumerateArray().FirstOrDefault();
+        if (location.ValueKind != JsonValueKind.Object)
+        {
+            return LocationContext.Approximate;
+        }
+
+        var settlement = GetFirstValue(location, "city", "town", "village", "municipality", "hamlet", "suburb", "county");
+        var region = GetFirstValue(location, "state", "province", "region", "county");
         if (string.IsNullOrWhiteSpace(settlement))
         {
-            return null;
+            return new LocationContext("Ubicación aproximada", region);
         }
 
-        if (!result.TryGetProperty("address", out var address))
-        {
-            return null;
-        }
-
-        var municipality = GetFirstValue(address, "city", "town", "village", "municipality", "county");
-        var region = GetFirstValue(address, "state", "province", "region", "county");
-        var province = string.IsNullOrWhiteSpace(region) ||
-                       string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
-            ? null
-            : region;
-        var searchText = string.Join(' ', new[] { settlement, municipality }
-            .Where(value => !string.IsNullOrWhiteSpace(value)));
-        return TryGetCoordinateProperty(result, "lat", out var latitude) &&
-               TryGetCoordinateProperty(result, "lon", out var longitude)
-            ? new SettlementSuggestion(settlement, province, latitude, longitude, searchText)
-            : null;
+        var displayName = string.IsNullOrWhiteSpace(region) ||
+                          string.Equals(settlement, region, StringComparison.OrdinalIgnoreCase)
+            ? settlement
+            : $"{settlement}, {region}";
+        return new LocationContext(displayName, region);
     }
+
+    private static long GetPopulation(JsonElement result) =>
+        result.TryGetProperty("population", out var population) && population.ValueKind == JsonValueKind.Number &&
+        population.TryGetInt64(out var value)
+            ? value
+            : 0;
+
+    private static string? NormalizeProvince(string? value) => value?
+        .Replace("Provincia de ", string.Empty, StringComparison.OrdinalIgnoreCase)
+        .Replace("Comunidad Autónoma de ", string.Empty, StringComparison.OrdinalIgnoreCase)
+        .Replace("Principado de ", string.Empty, StringComparison.OrdinalIgnoreCase);
 
     private static string NormalizeSearchTerm(string value)
     {
@@ -388,12 +288,7 @@ public sealed class LocationService(
     }
 }
 
-internal sealed record SettlementSuggestion(
-    string Name,
-    string? Province,
-    double Latitude,
-    double Longitude,
-    string SearchText);
+internal sealed record OpenMeteoSuggestion(LocationSuggestionDto Location, long Population);
 
 public sealed record LocationContext(string DisplayName, string? Region)
 {

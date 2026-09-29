@@ -62,6 +62,7 @@ builder.Services.AddOptions<JwtSettings>()
     .ValidateOnStart();
 
 builder.Services.Configure<ResendSettings>(builder.Configuration.GetSection(ResendSettings.SectionName));
+builder.Services.Configure<GeoapifySettings>(builder.Configuration.GetSection(GeoapifySettings.SectionName));
 
 var jwtSettings = builder.Configuration
     .GetRequiredSection(JwtSettings.SectionName)
@@ -104,10 +105,8 @@ builder.Services.AddHttpClient<CataloniaPollenService>(client =>
 });
 builder.Services.AddHttpClient<LocationService>(client =>
 {
-    client.BaseAddress = new Uri("https://nominatim.openstreetmap.org/");
+    client.BaseAddress = new Uri("https://api.geoapify.com/");
     client.Timeout = TimeSpan.FromSeconds(15);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd(
-        "AnteraApp/1.0 (+https://github.com/antera-dev/antera-app)");
 });
 builder.Services.AddHttpClient<AirQualityService>(client =>
 {
