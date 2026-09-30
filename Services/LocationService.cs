@@ -149,7 +149,7 @@ public sealed class LocationService(
 
     private static OpenMeteoSuggestion? ToOpenMeteoSuggestion(JsonElement result)
     {
-        var name = GetFirstValue(result, "name");
+        var name = NormalizeSpanishPlaceNameParticles(GetFirstValue(result, "name"));
         if (string.IsNullOrWhiteSpace(name) ||
             !TryGetCoordinateProperty(result, "latitude", out var latitude) ||
             !TryGetCoordinateProperty(result, "longitude", out var longitude))
@@ -157,7 +157,7 @@ public sealed class LocationService(
             return null;
         }
 
-        var province = NormalizeProvince(GetFirstValue(result, "admin2", "admin1"));
+        var province = NormalizeSpanishPlaceNameParticles(NormalizeProvince(GetFirstValue(result, "admin2", "admin1")));
         return new OpenMeteoSuggestion(
             new LocationSuggestionDto(name, province, latitude, longitude),
             GetPopulation(result));
@@ -192,8 +192,8 @@ public sealed class LocationService(
             return LocationContext.Approximate;
         }
 
-        var settlement = GetFirstValue(location, "city", "town", "village", "municipality", "hamlet", "suburb", "county");
-        var region = GetFirstValue(location, "state", "province", "region", "county");
+        var settlement = NormalizeSpanishPlaceNameParticles(GetFirstValue(location, "city", "town", "village", "municipality", "hamlet", "suburb", "county"));
+        var region = NormalizeSpanishPlaceNameParticles(GetFirstValue(location, "state", "province", "region", "county"));
         if (string.IsNullOrWhiteSpace(settlement))
         {
             return new LocationContext("Ubicación aproximada", region);
@@ -216,6 +216,25 @@ public sealed class LocationService(
         .Replace("Provincia de ", string.Empty, StringComparison.OrdinalIgnoreCase)
         .Replace("Comunidad Autónoma de ", string.Empty, StringComparison.OrdinalIgnoreCase)
         .Replace("Principado de ", string.Empty, StringComparison.OrdinalIgnoreCase);
+
+    private static string? NormalizeSpanishPlaceNameParticles(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        var words = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (var index = 1; index < words.Length; index++)
+        {
+            if (string.Equals(words[index], "de", StringComparison.OrdinalIgnoreCase))
+            {
+                words[index] = "de";
+            }
+        }
+
+        return string.Join(' ', words);
+    }
 
     private static string NormalizeSearchTerm(string value)
     {
