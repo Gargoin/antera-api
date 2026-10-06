@@ -3,6 +3,7 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace AnteraApp.Api.Models
 {
+    [BsonIgnoreExtraElements]
     public class User
     {
         [BsonId]
