@@ -8,11 +8,11 @@ public sealed class LoginAttemptLimiter(IMemoryCache cache)
     private static readonly TimeSpan Window = TimeSpan.FromMinutes(15);
     private readonly object _gate = new();
 
-    public TimeSpan? GetRetryAfter(string email, string clientKey)
+    public TimeSpan? GetRetryAfter(string email)
     {
         lock (_gate)
         {
-            var attempts = GetAttempts(email, clientKey);
+            var attempts = GetAttempts(email);
             RemoveExpiredAttempts(attempts);
             return attempts.Failures.Count < MaximumFailures
                 ? null
@@ -20,11 +20,11 @@ public sealed class LoginAttemptLimiter(IMemoryCache cache)
         }
     }
 
-    public TimeSpan? RecordFailure(string email, string clientKey)
+    public TimeSpan? RecordFailure(string email)
     {
         lock (_gate)
         {
-            var attempts = GetAttempts(email, clientKey);
+            var attempts = GetAttempts(email);
             RemoveExpiredAttempts(attempts);
             attempts.Failures.Enqueue(DateTime.UtcNow);
             return attempts.Failures.Count < MaximumFailures
@@ -33,10 +33,10 @@ public sealed class LoginAttemptLimiter(IMemoryCache cache)
         }
     }
 
-    public void Clear(string email, string clientKey) => cache.Remove(GetCacheKey(email, clientKey));
+    public void Clear(string email) => cache.Remove(GetCacheKey(email));
 
-    private LoginAttempts GetAttempts(string email, string clientKey) =>
-        cache.GetOrCreate(GetCacheKey(email, clientKey), entry =>
+    private LoginAttempts GetAttempts(string email) =>
+        cache.GetOrCreate(GetCacheKey(email), entry =>
         {
             entry.SetAbsoluteExpiration(Window);
             entry.SetSize(1);
@@ -52,8 +52,8 @@ public sealed class LoginAttemptLimiter(IMemoryCache cache)
         }
     }
 
-    private static string GetCacheKey(string email, string clientKey) =>
-        $"login-attempts:{email.Trim().ToUpperInvariant()}:{clientKey}";
+    private static string GetCacheKey(string email) =>
+        $"login-attempts:{email.Trim().ToUpperInvariant()}";
 
     private sealed class LoginAttempts
     {

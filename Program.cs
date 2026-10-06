@@ -629,8 +629,7 @@ app.MapPost("/api/auth/login", async (
     LoginRequest request,
     CancellationToken cancellationToken) =>
 {
-    var clientKey = GetClientPartitionKey(httpContext);
-    var retryAfter = loginAttemptLimiter.GetRetryAfter(request.Email, clientKey);
+    var retryAfter = loginAttemptLimiter.GetRetryAfter(request.Email);
     if (retryAfter is not null)
     {
         return LoginRateLimitResult(response, retryAfter.Value);
@@ -639,14 +638,14 @@ app.MapPost("/api/auth/login", async (
     var session = await authService.LoginAsync(request, cancellationToken);
     if (session == null)
     {
-        retryAfter = loginAttemptLimiter.RecordFailure(request.Email, clientKey);
+        retryAfter = loginAttemptLimiter.RecordFailure(request.Email);
         if (retryAfter is not null)
         {
             return LoginRateLimitResult(response, retryAfter.Value);
         }
         return Results.Unauthorized();
     }
-    loginAttemptLimiter.Clear(request.Email, clientKey);
+    loginAttemptLimiter.Clear(request.Email);
     if (session.EmailConfirmationRequired)
         return Results.StatusCode(StatusCodes.Status403Forbidden);
 
