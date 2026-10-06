@@ -8,6 +8,8 @@ using Microsoft.OpenApi;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -77,9 +79,60 @@ if (Encoding.UTF8.GetByteCount(jwtSettings.Secret) < 32)
 
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JwtService>();
+builder.Services.AddSingleton<LoginAttemptLimiter>();
 builder.Services.AddSingleton<PollenPreferencesService>();
 builder.Services.AddHttpClient<ResendEmailService>(client => client.BaseAddress = new Uri("https://api.resend.com/"));
-builder.Services.AddMemoryCache();
+builder.Services.AddMemoryCache(options => options.SizeLimit = 2_048);
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = (context, _) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds))
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return ValueTask.CompletedTask;
+    };
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(_ =>
+        RateLimitPartition.GetConcurrencyLimiter(
+            "api-global",
+            _ => new ConcurrencyLimiterOptions
+            {
+                PermitLimit = 100,
+                QueueLimit = 0,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+            }));
+    options.AddPolicy("login", context => RateLimitPartition.GetFixedWindowLimiter(
+        GetClientPartitionKey(context),
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(5),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+    options.AddPolicy("anonymous-auth", context => RateLimitPartition.GetFixedWindowLimiter(
+        GetClientPartitionKey(context),
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 12,
+            Window = TimeSpan.FromMinutes(5),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+    options.AddPolicy("public-data", context => RateLimitPartition.GetFixedWindowLimiter(
+        GetClientPartitionKey(context),
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        }));
+});
 builder.Services.AddHttpClient<PollenService>(client =>
 {
     client.BaseAddress = new Uri("https://air-quality-api.open-meteo.com/");
@@ -175,6 +228,7 @@ builder.Services.AddCors(options =>
             .WithOrigins([.. allowedFrontendOrigins.Distinct(StringComparer.OrdinalIgnoreCase)])
             .AllowAnyMethod()
             .AllowAnyHeader()
+            .WithExposedHeaders("Retry-After")
             .AllowCredentials()
     );
 });
@@ -182,6 +236,7 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 app.UseCors("AllowFrontend");
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 
@@ -242,6 +297,7 @@ app.MapGet("/api/locations/search", async (
             statusCode: StatusCodes.Status502BadGateway);
     }
 })
+.RequireRateLimiting("public-data")
 .WithName("SearchSpanishLocations");
 
 app.MapGet("/api/pollen/current", async (
@@ -271,6 +327,7 @@ app.MapGet("/api/pollen/current", async (
             statusCode: StatusCodes.Status502BadGateway);
     }
 })
+.RequireRateLimiting("public-data")
 .WithName("GetCurrentPollen");
 
 app.MapGet("/api/air-quality/current", async (
@@ -299,6 +356,7 @@ app.MapGet("/api/air-quality/current", async (
             statusCode: StatusCodes.Status502BadGateway);
     }
 })
+.RequireRateLimiting("public-data")
 .WithName("GetCurrentAirQuality");
 
 app.MapGet("/api/pollen/types", () => Results.Ok(PollenCatalog.Types))
@@ -390,6 +448,7 @@ app.MapPut("/api/user/profile", async (
 app.MapPut("/api/user/email", async (
     System.Security.Claims.ClaimsPrincipal user,
     AuthService authService,
+    ResendEmailService resendEmailService,
     UpdateUserEmailRequest request,
     CancellationToken cancellationToken) =>
 {
@@ -406,15 +465,38 @@ app.MapPut("/api/user/email", async (
         });
     }
 
-    var profile = await authService.UpdateEmailAsync(userId, email, request.CurrentPassword, cancellationToken);
-    return profile is null
-        ? Results.BadRequest(new { message = "No se ha podido validar el cambio de correo electrónico." })
-        : Results.Ok(profile);
+    var emailChange = await authService.RequestEmailChangeAsync(userId, email, request.CurrentPassword, cancellationToken);
+    if (emailChange.Confirmation is null)
+    {
+        return emailChange.Failure switch
+        {
+            EmailChangeRequestFailure.InvalidCurrentPassword => Results.BadRequest(new { message = "La contraseña no es correcta." }),
+            EmailChangeRequestFailure.EmailUnavailable => Results.Conflict(new { message = "Ese correo electrónico no está disponible." }),
+            EmailChangeRequestFailure.Cooldown => Results.StatusCode(StatusCodes.Status429TooManyRequests),
+            _ => Results.Problem(statusCode: StatusCodes.Status500InternalServerError)
+        };
+    }
+
+    try
+    {
+        await resendEmailService.SendConfirmationAsync(
+            emailChange.Confirmation.Recipient,
+            emailChange.Confirmation.Name,
+            emailChange.Confirmation.Token,
+            cancellationToken);
+        return Results.Accepted();
+    }
+    catch (InvalidOperationException)
+    {
+        return Results.Problem(title: "No se ha podido enviar el correo de confirmación.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
 })
 .RequireAuthorization("ConfirmedUser")
 .WithName("UpdateUserEmail");
 
 app.MapPut("/api/user/password", async (
+    HttpRequest httpRequest,
+    HttpResponse response,
     System.Security.Claims.ClaimsPrincipal user,
     AuthService authService,
     UpdateUserPasswordRequest request,
@@ -432,20 +514,44 @@ app.MapPut("/api/user/password", async (
         });
     }
 
-    var updated = await authService.UpdatePasswordAsync(
+    return await ChangePasswordAsync(
+        httpRequest,
+        response,
         userId,
-        request.CurrentPassword,
-        request.NewPassword,
+        authService,
+        request,
+        jwtSettings,
+        !app.Environment.IsDevelopment(),
+        preserveCurrentSession: false,
         cancellationToken);
-    return updated switch
-    {
-        null => Results.Unauthorized(),
-        false => Results.BadRequest(new { message = "La contraseña actual no es correcta." }),
-        true => Results.NoContent()
-    };
 })
 .RequireAuthorization("ConfirmedUser")
 .WithName("UpdateUserPassword");
+
+app.MapPut("/api/auth/change-password", async (
+    HttpRequest httpRequest,
+    HttpResponse response,
+    System.Security.Claims.ClaimsPrincipal user,
+    AuthService authService,
+    UpdateUserPasswordRequest request,
+    CancellationToken cancellationToken) =>
+{
+    var userId = GetUserId(user);
+    if (userId is null) return Results.Unauthorized();
+
+    return await ChangePasswordAsync(
+        httpRequest,
+        response,
+        userId,
+        authService,
+        request,
+        jwtSettings,
+        !app.Environment.IsDevelopment(),
+        preserveCurrentSession: true,
+        cancellationToken);
+})
+.RequireAuthorization("ConfirmedUser")
+.WithName("ChangeUserPassword");
 
 app.MapDelete("/api/user/account", async (
     HttpResponse response,
@@ -511,17 +617,35 @@ app.MapPost("/api/auth/register", async (
 
     return Results.Created("/api/user/pollen-preferences", new AuthResponse { Token = token });
 })
+.RequireRateLimiting("anonymous-auth")
 .WithName("RegisterUser");
 
 app.MapPost("/api/auth/login", async (
+    HttpContext httpContext,
     HttpResponse response,
     AuthService authService,
+    LoginAttemptLimiter loginAttemptLimiter,
     LoginRequest request,
     CancellationToken cancellationToken) =>
 {
+    var clientKey = GetClientPartitionKey(httpContext);
+    var retryAfter = loginAttemptLimiter.GetRetryAfter(request.Email, clientKey);
+    if (retryAfter is not null)
+    {
+        return LoginRateLimitResult(response, retryAfter.Value);
+    }
+
     var session = await authService.LoginAsync(request, cancellationToken);
     if (session == null)
+    {
+        retryAfter = loginAttemptLimiter.RecordFailure(request.Email, clientKey);
+        if (retryAfter is not null)
+        {
+            return LoginRateLimitResult(response, retryAfter.Value);
+        }
         return Results.Unauthorized();
+    }
+    loginAttemptLimiter.Clear(request.Email, clientKey);
     if (session.EmailConfirmationRequired)
         return Results.StatusCode(StatusCodes.Status403Forbidden);
 
@@ -540,6 +664,7 @@ app.MapPost("/api/auth/login", async (
 
     return Results.Ok(new AuthResponse { Token = session.AccessToken });
 })
+.RequireRateLimiting("login")
 .WithName("LoginUser");
 
 app.MapPost("/api/auth/send-email-confirmation", async (
@@ -598,6 +723,7 @@ app.MapPost("/api/auth/resend-email-confirmation", async (
 
     return Results.Accepted();
 })
+.RequireRateLimiting("anonymous-auth")
 .WithName("ResendEmailConfirmation");
 
 app.MapPost("/api/auth/confirm-email", async (
@@ -643,6 +769,7 @@ app.MapPost("/api/auth/forgot-password", async (
 
     return Results.Accepted();
 })
+.RequireRateLimiting("anonymous-auth")
 .WithName("ForgotPassword");
 
 app.MapPost("/api/auth/reset-password", async (
@@ -667,6 +794,7 @@ app.MapPost("/api/auth/reset-password", async (
     DeleteRefreshTokenCookie(response);
     return Results.NoContent();
 })
+.RequireRateLimiting("anonymous-auth")
 .WithName("ResetPassword");
 
 app.MapPost("/api/auth/refresh", async (
@@ -742,6 +870,75 @@ static void SetRefreshTokenCookie(
 
 static void DeleteRefreshTokenCookie(HttpResponse response) =>
     response.Cookies.Delete("antera_refresh", new CookieOptions { Path = "/api/auth" });
+
+static async Task<IResult> ChangePasswordAsync(
+    HttpRequest httpRequest,
+    HttpResponse response,
+    string userId,
+    AuthService authService,
+    UpdateUserPasswordRequest request,
+    JwtSettings jwtSettings,
+    bool secureCookie,
+    bool preserveCurrentSession,
+    CancellationToken cancellationToken)
+{
+    if (string.IsNullOrWhiteSpace(request.CurrentPassword) ||
+        string.IsNullOrWhiteSpace(request.NewPassword) ||
+        request.NewPassword.Length is < 8 or > 128)
+    {
+        return Results.ValidationProblem(new Dictionary<string, string[]>
+        {
+            ["password"] = ["La nueva contraseña debe tener entre 8 y 128 caracteres."]
+        });
+    }
+
+    var currentRefreshToken = preserveCurrentSession &&
+        httpRequest.Cookies.TryGetValue("antera_refresh", out var refreshToken) &&
+        !string.IsNullOrWhiteSpace(refreshToken)
+            ? refreshToken
+            : null;
+    var result = await authService.UpdatePasswordAsync(
+        userId,
+        request.CurrentPassword,
+        request.NewPassword,
+        currentRefreshToken,
+        cancellationToken);
+    if (result is null)
+    {
+        return Results.Unauthorized();
+    }
+    if (!result.Succeeded)
+    {
+        return Results.BadRequest(new { message = "La contraseña actual no es correcta." });
+    }
+
+    if (preserveCurrentSession)
+    {
+        if (result.RefreshToken is not null)
+        {
+            SetRefreshTokenCookie(response, result.RefreshToken, jwtSettings.RefreshTokenExpirationDays, secureCookie);
+        }
+        else
+        {
+            DeleteRefreshTokenCookie(response);
+        }
+    }
+
+    return Results.NoContent();
+}
+
+static string GetClientPartitionKey(HttpContext context) =>
+    context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+static IResult LoginRateLimitResult(HttpResponse response, TimeSpan retryAfter)
+{
+    var retryAfterSeconds = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds));
+    var retryAfterMinutes = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalMinutes));
+    response.Headers.RetryAfter = retryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    return Results.Problem(
+        title: $"Has superado el límite de intentos. Inténtalo de nuevo en {retryAfterMinutes} minuto{(retryAfterMinutes == 1 ? string.Empty : "s")}.",
+        statusCode: StatusCodes.Status429TooManyRequests);
+}
 
 static string? GetUserId(System.Security.Claims.ClaimsPrincipal user) =>
     user.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value

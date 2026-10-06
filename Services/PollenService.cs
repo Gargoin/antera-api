@@ -34,6 +34,7 @@ public sealed class PollenService(
         var reading = await cache.GetOrCreateAsync(cacheKey, async entry =>
         {
             entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);
+            entry.SetSize(1);
             return await GetCurrentUncachedAsync(latitude, longitude, cancellationToken);
         });
 

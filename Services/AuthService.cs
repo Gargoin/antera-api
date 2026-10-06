@@ -105,7 +105,7 @@ namespace AnteraApp.Api.Services
         {
             var now = DateTime.UtcNow;
             var tokenHash = HashToken(token);
-            var result = await _users.UpdateOneAsync(
+            var initialConfirmation = await _users.UpdateOneAsync(
                 candidate => candidate.EmailConfirmedAt == null &&
                     candidate.EmailConfirmationTokenHash == tokenHash &&
                     candidate.EmailConfirmationTokenExpiresAt > now,
@@ -114,7 +114,34 @@ namespace AnteraApp.Api.Services
                     .Unset(candidate => candidate.EmailConfirmationTokenHash)
                     .Unset(candidate => candidate.EmailConfirmationTokenExpiresAt),
                 cancellationToken: cancellationToken);
-            return result.ModifiedCount == 1;
+            if (initialConfirmation.ModifiedCount == 1)
+            {
+                return true;
+            }
+
+            var pendingEmailOwner = await _users.Find(candidate =>
+                    candidate.PendingEmail != null &&
+                    candidate.PendingEmailConfirmationTokenHash == tokenHash &&
+                    candidate.PendingEmailConfirmationTokenExpiresAt > now)
+                .FirstOrDefaultAsync(cancellationToken);
+            if (pendingEmailOwner?.PendingEmail is null)
+            {
+                return false;
+            }
+
+            var emailChangeConfirmation = await _users.UpdateOneAsync(
+                candidate => candidate.Id == pendingEmailOwner.Id &&
+                    candidate.PendingEmailConfirmationTokenHash == tokenHash &&
+                    candidate.PendingEmailConfirmationTokenExpiresAt > now,
+                Builders<User>.Update
+                    .Set(candidate => candidate.Email, pendingEmailOwner.PendingEmail)
+                    .Set(candidate => candidate.EmailConfirmedAt, now)
+                    .Unset(candidate => candidate.PendingEmail)
+                    .Unset(candidate => candidate.PendingEmailConfirmationTokenHash)
+                    .Unset(candidate => candidate.PendingEmailConfirmationTokenExpiresAt)
+                    .Unset(candidate => candidate.PendingEmailConfirmationLastSentAt),
+                cancellationToken: cancellationToken);
+            return emailChangeConfirmation.ModifiedCount == 1;
         }
 
         public async Task<PasswordReset?> CreatePasswordResetForEmailAsync(
@@ -128,19 +155,22 @@ namespace AnteraApp.Api.Services
             }
 
             var now = DateTime.UtcNow;
-            if (user.PasswordResetLastSentAt > now.AddMinutes(-1))
-            {
-                return null;
-            }
-
             var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
-            await _users.UpdateOneAsync(
-                candidate => candidate.Id == user.Id,
+            var reserved = await _users.UpdateOneAsync(
+                Builders<User>.Filter.And(
+                    Builders<User>.Filter.Eq(candidate => candidate.Id, user.Id),
+                    Builders<User>.Filter.Or(
+                        Builders<User>.Filter.Eq(candidate => candidate.PasswordResetLastSentAt, null),
+                        Builders<User>.Filter.Lte(candidate => candidate.PasswordResetLastSentAt, now.AddMinutes(-1)))),
                 Builders<User>.Update
                     .Set(candidate => candidate.PasswordResetTokenHash, HashToken(token))
                     .Set(candidate => candidate.PasswordResetTokenExpiresAt, now.AddHours(1))
                     .Set(candidate => candidate.PasswordResetLastSentAt, now),
                 cancellationToken: cancellationToken);
+            if (reserved.ModifiedCount != 1)
+            {
+                return null;
+            }
 
             return new PasswordReset(user.Email, user.Name, token);
         }
@@ -155,6 +185,7 @@ namespace AnteraApp.Api.Services
                 Builders<User>.Update
                     .Set(candidate => candidate.PasswordHash, passwordHash)
                     .Set(candidate => candidate.RefreshTokens, new List<RefreshTokenSession>())
+                    .Inc(candidate => candidate.SessionVersion, 1)
                     .Unset(candidate => candidate.PasswordResetTokenHash)
                     .Unset(candidate => candidate.PasswordResetTokenExpiresAt),
                 cancellationToken: cancellationToken);
@@ -179,24 +210,20 @@ namespace AnteraApp.Api.Services
                 Builders<User>.Filter.ElemMatch(
                     user => user.RefreshTokens,
                     session => session.TokenHash == tokenHash && session.ExpiresAt > now));
-            var options = new FindOneAndUpdateOptions<User>
-            {
-                ReturnDocument = ReturnDocument.After
-            };
-
             var user = await _users.FindOneAndUpdateAsync(
                 filter,
                 Builders<User>.Update.PullFilter(
                     candidate => candidate.RefreshTokens,
                     session => session.TokenHash == tokenHash),
-                options,
-                cancellationToken);
+                new FindOneAndUpdateOptions<User> { ReturnDocument = ReturnDocument.Before },
+                cancellationToken: cancellationToken);
             if (user is null) return null;
 
-            await _users.UpdateOneAsync(
-                candidate => candidate.Id == user.Id,
+            var rotated = await _users.UpdateOneAsync(
+                candidate => candidate.Id == user.Id && candidate.SessionVersion == user.SessionVersion,
                 Builders<User>.Update.Push(candidate => candidate.RefreshTokens, newSession),
                 cancellationToken: cancellationToken);
+            if (rotated.ModifiedCount != 1) return null;
 
             return new AuthSession
             {
@@ -237,44 +264,84 @@ namespace AnteraApp.Api.Services
             return result is null ? null : ToUserProfileResponse(result);
         }
 
-        public async Task<UserProfileResponse?> UpdateEmailAsync(
+        public async Task<EmailChangeRequestResult> RequestEmailChangeAsync(
             string userId,
             string email,
             string currentPassword,
             CancellationToken cancellationToken)
         {
             var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
-            if (user is null || VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return null;
+            if (user is null || VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed)
+            {
+                return new EmailChangeRequestResult(null, EmailChangeRequestFailure.InvalidCurrentPassword);
+            }
+            if (string.Equals(user.Email, email, StringComparison.OrdinalIgnoreCase))
+            {
+                return new EmailChangeRequestResult(null, EmailChangeRequestFailure.EmailUnavailable);
+            }
 
             var existing = await _users.Find(candidate => candidate.Email == email && candidate.Id != userId)
                 .FirstOrDefaultAsync(cancellationToken);
-            if (existing is not null) return null;
+            if (existing is not null)
+            {
+                return new EmailChangeRequestResult(null, EmailChangeRequestFailure.EmailUnavailable);
+            }
 
-            var result = await _users.FindOneAndUpdateAsync(
-                candidate => candidate.Id == userId,
-                Builders<User>.Update.Set(candidate => candidate.Email, email),
-                new FindOneAndUpdateOptions<User> { ReturnDocument = ReturnDocument.After },
-                cancellationToken);
-
-            return result is null ? null : ToUserProfileResponse(result);
+            var now = DateTime.UtcNow;
+            var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
+            var result = await _users.UpdateOneAsync(
+                Builders<User>.Filter.And(
+                    Builders<User>.Filter.Eq(candidate => candidate.Id, userId),
+                    Builders<User>.Filter.Or(
+                        Builders<User>.Filter.Eq(candidate => candidate.PendingEmailConfirmationLastSentAt, null),
+                        Builders<User>.Filter.Lte(candidate => candidate.PendingEmailConfirmationLastSentAt, now.AddMinutes(-1)))),
+                Builders<User>.Update
+                    .Set(candidate => candidate.PendingEmail, email)
+                    .Set(candidate => candidate.PendingEmailConfirmationTokenHash, HashToken(token))
+                    .Set(candidate => candidate.PendingEmailConfirmationTokenExpiresAt, now.AddHours(24))
+                    .Set(candidate => candidate.PendingEmailConfirmationLastSentAt, now)
+                    .Unset(candidate => candidate.PasswordResetTokenHash)
+                    .Unset(candidate => candidate.PasswordResetTokenExpiresAt),
+                cancellationToken: cancellationToken);
+            return result.ModifiedCount == 1
+                ? new EmailChangeRequestResult(new EmailConfirmation(email, user.Name, token), EmailChangeRequestFailure.None)
+                : new EmailChangeRequestResult(null, EmailChangeRequestFailure.Cooldown);
         }
 
-        public async Task<bool?> UpdatePasswordAsync(
+        public async Task<PasswordUpdateResult?> UpdatePasswordAsync(
             string userId,
             string currentPassword,
             string newPassword,
+            string? currentRefreshToken,
             CancellationToken cancellationToken)
         {
             var user = await _users.Find(candidate => candidate.Id == userId).FirstOrDefaultAsync(cancellationToken);
             if (user is null) return null;
-            if (VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return false;
+            if (VerifyPassword(user, currentPassword) == PasswordVerificationResult.Failed) return PasswordUpdateResult.InvalidCurrentPassword;
 
-            user.PasswordHash = _passwordHasher.HashPassword(user, newPassword);
-            await _users.UpdateOneAsync(
-                candidate => candidate.Id == userId,
-                Builders<User>.Update.Set(candidate => candidate.PasswordHash, user.PasswordHash),
+            var now = DateTime.UtcNow;
+            var keepCurrentSession = !string.IsNullOrWhiteSpace(currentRefreshToken) &&
+                user.RefreshTokens.Any(session => session.TokenHash == HashToken(currentRefreshToken) && session.ExpiresAt > now);
+            var replacementRefreshToken = keepCurrentSession ? CreateRefreshToken() : null;
+            var refreshSessions = replacementRefreshToken is null
+                ? new List<RefreshTokenSession>()
+                :
+                [new RefreshTokenSession
+                {
+                    TokenHash = HashToken(replacementRefreshToken),
+                    ExpiresAt = now.AddDays(GetRefreshTokenExpirationDays())
+                }];
+            var passwordHash = _passwordHasher.HashPassword(user, newPassword);
+            var updated = await _users.UpdateOneAsync(
+                candidate => candidate.Id == userId && candidate.PasswordHash == user.PasswordHash,
+                Builders<User>.Update
+                    .Set(candidate => candidate.PasswordHash, passwordHash)
+                    .Set(candidate => candidate.RefreshTokens, refreshSessions)
+                    .Inc(candidate => candidate.SessionVersion, 1),
                 cancellationToken: cancellationToken);
-            return true;
+            return updated.ModifiedCount == 1
+                ? new PasswordUpdateResult(true, replacementRefreshToken)
+                : null;
         }
 
         public async Task<DeletedAccount?> DeleteAccountAsync(
@@ -336,19 +403,22 @@ namespace AnteraApp.Api.Services
             }
 
             var now = DateTime.UtcNow;
-            if (user.EmailConfirmationLastSentAt > now.AddMinutes(-1))
-            {
-                return null;
-            }
-
             var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
-            await _users.UpdateOneAsync(
-                candidate => candidate.Id == user.Id,
+            var reserved = await _users.UpdateOneAsync(
+                Builders<User>.Filter.And(
+                    Builders<User>.Filter.Eq(candidate => candidate.Id, user.Id),
+                    Builders<User>.Filter.Or(
+                        Builders<User>.Filter.Eq(candidate => candidate.EmailConfirmationLastSentAt, null),
+                        Builders<User>.Filter.Lte(candidate => candidate.EmailConfirmationLastSentAt, now.AddMinutes(-1)))),
                 Builders<User>.Update
                     .Set(candidate => candidate.EmailConfirmationTokenHash, HashToken(token))
                     .Set(candidate => candidate.EmailConfirmationTokenExpiresAt, now.AddHours(24))
                     .Set(candidate => candidate.EmailConfirmationLastSentAt, now),
                 cancellationToken: cancellationToken);
+            if (reserved.ModifiedCount != 1)
+            {
+                return null;
+            }
 
             return new EmailConfirmation(user.Email, user.Name, token);
         }

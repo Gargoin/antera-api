@@ -24,6 +24,9 @@ namespace AnteraApp.Api.Models
         [BsonElement("refreshTokens")]
         public List<RefreshTokenSession> RefreshTokens { get; set; } = [];
 
+        [BsonElement("sessionVersion")]
+        public int SessionVersion { get; set; }
+
         [BsonElement("emailConfirmedAt")]
         public DateTime? EmailConfirmedAt { get; set; }
 
@@ -44,5 +47,17 @@ namespace AnteraApp.Api.Models
 
         [BsonElement("passwordResetLastSentAt")]
         public DateTime? PasswordResetLastSentAt { get; set; }
+
+        [BsonElement("pendingEmail")]
+        public string? PendingEmail { get; set; }
+
+        [BsonElement("pendingEmailConfirmationTokenHash")]
+        public string? PendingEmailConfirmationTokenHash { get; set; }
+
+        [BsonElement("pendingEmailConfirmationTokenExpiresAt")]
+        public DateTime? PendingEmailConfirmationTokenExpiresAt { get; set; }
+
+        [BsonElement("pendingEmailConfirmationLastSentAt")]
+        public DateTime? PendingEmailConfirmationLastSentAt { get; set; }
     }
 }

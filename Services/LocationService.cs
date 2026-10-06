@@ -55,7 +55,9 @@ public sealed class LocationService(
         // Una respuesta sin localidad puede ser transitoria. No la retenemos durante horas.
         if (!string.Equals(context.DisplayName, LocationContext.Approximate.DisplayName, StringComparison.Ordinal))
         {
-            cache.Set(cacheKey, context, TimeSpan.FromHours(12));
+            cache.Set(cacheKey, context, new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromHours(12))
+                .SetSize(1));
         }
 
         return context;
@@ -92,10 +94,9 @@ public sealed class LocationService(
             .Select(group => group.First())
             .Take(6)
             .ToArray();
-        if (suggestions.Length > 0)
-        {
-            cache.Set(cacheKey, suggestions, TimeSpan.FromHours(12));
-        }
+        cache.Set(cacheKey, suggestions, new MemoryCacheEntryOptions()
+            .SetAbsoluteExpiration(suggestions.Length > 0 ? TimeSpan.FromHours(12) : TimeSpan.FromMinutes(2))
+            .SetSize(1));
 
         return suggestions;
     }
