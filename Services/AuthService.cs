@@ -45,7 +45,9 @@ namespace AnteraApp.Api.Services
             {
                 Email = request.Email,
                 Name = request.Name,
-                EmailConfirmationTokenHash = "pending"
+                EmailConfirmationTokenHash = "pending",
+                AcceptedTermsVersion = "1.0",
+                TermsAcceptedAtUtc = DateTime.UtcNow
             };
 
             user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);

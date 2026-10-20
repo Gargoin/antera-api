@@ -606,6 +606,8 @@ app.MapPost("/api/auth/register", async (
         validationErrors["email"] = ["Introduce un correo electrónico válido."];
     if (string.IsNullOrWhiteSpace(request.Password) || request.Password.Length is < 8 or > 128)
         validationErrors["password"] = ["La contraseña debe tener entre 8 y 128 caracteres."];
+    if (!request.AcceptTerms)
+        validationErrors["terms"] = ["Debes aceptar los términos y condiciones para continuar."];
 
     if (validationErrors.Count > 0)
     {

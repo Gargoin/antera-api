@@ -28,6 +28,12 @@ namespace AnteraApp.Api.Models
         [BsonElement("sessionVersion")]
         public int SessionVersion { get; set; }
 
+        [BsonElement("acceptedTermsVersion")]
+        public string? AcceptedTermsVersion { get; set; }
+
+        [BsonElement("termsAcceptedAtUtc")]
+        public DateTime? TermsAcceptedAtUtc { get; set; }
+
         [BsonElement("emailConfirmedAt")]
         public DateTime? EmailConfirmedAt { get; set; }
 
